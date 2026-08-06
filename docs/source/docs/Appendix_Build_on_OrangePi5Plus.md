@@ -216,7 +216,8 @@ The Orange Pi 5 Plus Ubuntu image includes pre-configured GStreamer packages wit
 sudo apt-get update
 sudo apt install -y python3-pip ninja-build
 sudo pip install meson
-sudo apt-get install -y libeigen3-dev libjson-glib-dev librdkafka-dev libmosquitto-dev libyuv-dev
+sudo apt-get install -y libeigen3-dev libjson-glib-dev librdkafka-dev libmosquitto-dev libyuv-dev \
+                        libprotobuf-dev protobuf-compiler
 ```
 
 **Package Descriptions**  
@@ -227,6 +228,9 @@ sudo apt-get install -y libeigen3-dev libjson-glib-dev librdkafka-dev libmosquit
 - `librdkafka-dev`: Apache Kafka client library  
 - `libmosquitto-dev`: MQTT broker client library  
 - `libyuv-dev`: YUV color space conversion library  
+- `libprotobuf-dev`, `protobuf-compiler`: Protocol Buffers runtime and `protoc`. **Optional** —
+  they enable the `dx_msgconvl` protobuf payload backend (`payload-type=4`). If absent, meson
+  auto-disables that backend and the JSON payload still builds  
 
 ### [Step 3.2] Cloning & Compiling DX-Stream
 

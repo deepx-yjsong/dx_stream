@@ -276,5 +276,9 @@ if not exist "!VCPKG_INSTALLED!\lib\pkgconfig\rdkafka.pc" (
     echo   [MISSING] vcpkg librdkafka: !VCPKG_INSTALLED!\lib\pkgconfig\rdkafka.pc
     set "VCPKG_DEPS_OK=0"
 )
+if not exist "!VCPKG_INSTALLED!\lib\pkgconfig\protobuf.pc" (
+    echo   [MISSING] vcpkg protobuf: !VCPKG_INSTALLED!\lib\pkgconfig\protobuf.pc
+    set "VCPKG_DEPS_OK=0"
+)
 if "!VCPKG_DEPS_OK!"=="1" exit /b 0
 exit /b 1

@@ -8,6 +8,7 @@
     "opencv4",
     "libyuv",
     "mosquitto",
-    "librdkafka"
+    "librdkafka",
+    "protobuf"
   ]
 }

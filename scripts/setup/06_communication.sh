@@ -64,6 +64,10 @@ setup_communication_libraries() {
         "libjson-glib-dev:JSON handling library for GLib"
         "librdkafka-dev:Apache Kafka C/C++ library"
         "libmosquitto-dev:MQTT client library"
+        # Optional for dx_msgconvl: enables the protobuf payload backend
+        # (payload-type=4). Absent -> meson auto-disables it and JSON still builds.
+        "libprotobuf-dev:Protocol Buffers C++ runtime (optional, dx_msgconvl protobuf payload)"
+        "protobuf-compiler:Protocol Buffers compiler providing protoc (optional, dx_frame.proto codegen)"
     )
     
     local missing_libs=()

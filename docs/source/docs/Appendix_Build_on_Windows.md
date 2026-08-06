@@ -110,7 +110,7 @@ This automatically:
 - Step 1. Verifies all prerequisites are present  
 - Step 2. Installs `meson` and `ninja` via pip  
 - Step 3. Clones and bootstraps vcpkg (if not present)  
-- Step 4. Installs C++ libraries via vcpkg: eigen3, opencv4, libyuv, mosquitto, librdkafka  
+- Step 4. Installs C++ libraries via vcpkg: eigen3, opencv4, libyuv, mosquitto, librdkafka, protobuf  
 - Step 5. Generates `opencv4.pc` (required for meson to find OpenCV)  
 - Step 6. Validates DEEPX_SDK_DIR path  
 
@@ -119,9 +119,9 @@ This automatically:
 On an internet-connected machine. 
 ```cmd
 C:\vcpkg\vcpkg install eigen3:x64-windows opencv4:x64-windows libyuv:x64-windows ^
-                       mosquitto:x64-windows librdkafka:x64-windows
+                       mosquitto:x64-windows librdkafka:x64-windows protobuf:x64-windows
 C:\vcpkg\vcpkg export eigen3:x64-windows opencv4:x64-windows libyuv:x64-windows ^
-                       mosquitto:x64-windows librdkafka:x64-windows --zip
+                       mosquitto:x64-windows librdkafka:x64-windows protobuf:x64-windows --zip
 ```
 
 Copy the resulting zip to the air-gapped machine, extract `installed/x64-windows/` to:
