@@ -66,6 +66,22 @@ static void send_wrapped_eos(GstAggregator *agg, gint stream_id) {
     gst_pad_push_event(GST_AGGREGATOR_SRC_PAD(agg), wrapped);
 }
 
+// set-sensor-id action signal handler: maps a positional stream_id (sink pad
+// index) to a stable per-stream identity stamped onto DXFrameMeta in clip().
+static void gst_dxinputselector_set_sensor_id(GstDxInputSelector *self,
+                                              guint stream_id,
+                                              const gchar *sensor_id) {
+    g_mutex_lock(&self->_sensor_ids_lock);
+    if (sensor_id && *sensor_id) {
+        self->_sensor_ids[(int)stream_id] = sensor_id;
+    } else {
+        self->_sensor_ids.erase((int)stream_id);
+    }
+    g_mutex_unlock(&self->_sensor_ids_lock);
+    GST_INFO_OBJECT(self, "set-sensor-id: stream [%u] -> '%s'", stream_id,
+                    sensor_id ? sensor_id : "(null)");
+}
+
 static GstBuffer *
 gst_dxinputselector_clip(GstAggregator *agg, GstAggregatorPad *pad,
                           GstBuffer *buf) {
@@ -84,6 +100,14 @@ gst_dxinputselector_clip(GstAggregator *agg, GstAggregatorPad *pad,
         }
         GstCaps *caps = gst_pad_get_current_caps(GST_PAD(pad));
         meta->_stream_id = get_sink_pad_index(GST_PAD(pad));
+        {
+            GstDxInputSelector *self = GST_DXINPUTSELECTOR(agg);
+            g_mutex_lock(&self->_sensor_ids_lock);
+            auto it = self->_sensor_ids.find(meta->_stream_id);
+            if (it != self->_sensor_ids.end())
+                meta->_sensor_id = it->second;
+            g_mutex_unlock(&self->_sensor_ids_lock);
+        }
         if (caps) {
             const GstStructure *s = gst_caps_get_structure(caps, 0);
             meta->_name = gst_structure_get_name(s);
@@ -226,6 +250,9 @@ static void gst_dxinputselector_release_pad(GstElement *element, GstPad *pad) {
     GST_OBJECT_LOCK(self);
     self->_stream_eos_sent.erase(stream_id);
     GST_OBJECT_UNLOCK(self);
+    g_mutex_lock(&self->_sensor_ids_lock);
+    self->_sensor_ids.erase(stream_id);
+    g_mutex_unlock(&self->_sensor_ids_lock);
     GST_ELEMENT_CLASS(parent_class)->release_pad(element, pad);
 }
 
@@ -254,6 +281,12 @@ static void gst_dxinputselector_class_init(GstDxInputSelectorClass *klass) {
         "Input Selection from Multi Channel Streams (N:1)",
         "Sangil Jo <sijo@deepx.ai>");
 
+    g_signal_new_class_handler(
+        "set-sensor-id", G_TYPE_FROM_CLASS(klass),
+        (GSignalFlags)(G_SIGNAL_RUN_LAST | G_SIGNAL_ACTION),
+        G_CALLBACK(gst_dxinputselector_set_sensor_id), nullptr, nullptr, nullptr,
+        G_TYPE_NONE, 2, G_TYPE_UINT, G_TYPE_STRING);
+
     gst_element_class_add_static_pad_template_with_gtype(
         element_class, &sink_template, GST_TYPE_AGGREGATOR_PAD);
     gst_element_class_add_static_pad_template(element_class, &src_template);
@@ -276,12 +309,16 @@ static void gst_dxinputselector_init(GstDxInputSelector *self) {
     // Skipping this crashes on MSVC (null tree sentinel) the first time the
     // set is touched (e.g. _stream_eos_sent.clear() in start()).
     new (&self->_stream_eos_sent) std::set<int>();
+    new (&self->_sensor_ids) std::map<int, std::string>();
+    g_mutex_init(&self->_sensor_ids_lock);
     self->_max_queue_size = 2;
 }
 
 static void gst_dxinputselector_finalize(GObject *object) {
     GstDxInputSelector *self = GST_DXINPUTSELECTOR(object);
     self->_stream_eos_sent.~set();
+    self->_sensor_ids.~map();
+    g_mutex_clear(&self->_sensor_ids_lock);
     G_OBJECT_CLASS(parent_class)->finalize(object);
 }
 

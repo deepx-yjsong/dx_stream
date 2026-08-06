@@ -1,0 +1,43 @@
+syntax = "proto3";
+
+package dxargus;
+
+// One detected/tracked object inside a frame.
+message BBox {
+  float start_x = 1;
+  float start_y = 2;
+  float end_x = 3;
+  float end_y = 4;
+}
+
+message Keypoint {
+  float x = 1;
+  float y = 2;
+  float score = 3;
+}
+
+message Detection {
+  int32 label_id = 1;
+  int32 track_id = 2;
+  float confidence = 3;
+  string name = 4;
+  BBox box = 5;
+  repeated Keypoint keypoints = 6;  // pose models; empty otherwise
+}
+
+// One inference result frame. Field-for-field equivalent to the JSON that
+// dxpayload_convert_to_json emits (streamId/seqId/width/height/sensor_id/
+// node_id/pts_ns/ntp_timestamp_ns/objects), so switching payload-type between
+// json and protobuf does not change what a consumer receives, only how it is
+// encoded.
+message SensorFrame {
+  string sensor_id = 1;            // per-stream camera identity (DXFrameMeta._sensor_id)
+  string node_id = 2;             // edge-global node identity (dxmsgconv node-id)
+  int32 stream_id = 3;            // positional pad index (topology-dependent)
+  uint64 seq_id = 4;             // per-stream sequence counter
+  int32 width = 5;
+  int32 height = 6;
+  int64 pts_ns = 7;             // GstBuffer PTS (ns); -1 if NONE
+  int64 ntp_timestamp_ns = 8;   // wall-clock NTP (ns); < 0 means unavailable
+  repeated Detection objects = 9;
+}

@@ -30,6 +30,8 @@ struct _GstDxMsgConv {
     GstVideoInfo _input_info;
     gchar *_config_file_path;
     gchar *_library_file_path;
+    gchar *_node_id;
+    gint _payload_type;
     void *_library_handle;
     gboolean _include_frame;
     int _cached_width;

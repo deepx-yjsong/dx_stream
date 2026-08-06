@@ -16,7 +16,9 @@ enum class PropertyID {
     PROP_CONFIG_FILE_PATH,
     PROP_LIBRARY_FILE_PATH,
     PROP_MESSAGE_INTERVAL,
-    PROP_INCLUDE_FRAME
+    PROP_INCLUDE_FRAME,
+    PROP_NODE_ID,
+    PROP_PAYLOAD_TYPE
 };
 
 GST_DEBUG_CATEGORY_STATIC(gst_dxmsgconv_debug_category);
@@ -28,6 +30,8 @@ static gboolean gst_dxmsgconv_start(GstBaseTransform *trans);
 static gboolean gst_dxmsgconv_stop(GstBaseTransform *trans);
 static gboolean gst_dxmsgconv_set_caps(GstBaseTransform *trans,
                                        GstCaps *incaps, GstCaps *outcaps);
+static gboolean gst_dxmsgconv_sink_event(GstBaseTransform *trans,
+                                         GstEvent *event);
 static gboolean gst_dxmsgconv_propose_allocation(GstBaseTransform *trans,
                                                  GstQuery *decide_query,
                                                  GstQuery *query);
@@ -52,6 +56,7 @@ static void gst_dxmsgconv_finalize(GObject *object) {
 
     g_free(self->_config_file_path);
     g_free(self->_library_file_path);
+    g_free(self->_node_id);
 
     self->_kernel_pool.~unique_ptr();
     self->_rgb_buf.~vector();
@@ -131,6 +136,13 @@ static void gst_dxmsgconv_set_property(GObject *object, guint prop_id,
     case PropertyID::PROP_INCLUDE_FRAME:
         self->_include_frame = g_value_get_boolean(value);
         break;
+    case PropertyID::PROP_NODE_ID:
+        g_free(self->_node_id);
+        self->_node_id = g_value_dup_string(value);
+        break;
+    case PropertyID::PROP_PAYLOAD_TYPE:
+        self->_payload_type = g_value_get_enum(value);
+        break;
     default:
         G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
         break;
@@ -154,6 +166,12 @@ static void gst_dxmsgconv_get_property(GObject *object, guint prop_id,
         break;
     case PropertyID::PROP_INCLUDE_FRAME:
         g_value_set_boolean(value, self->_include_frame);
+        break;
+    case PropertyID::PROP_NODE_ID:
+        g_value_set_string(value, self->_node_id);
+        break;
+    case PropertyID::PROP_PAYLOAD_TYPE:
+        g_value_set_enum(value, self->_payload_type);
         break;
     default:
         G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
@@ -201,6 +219,22 @@ static void gst_dxmsgconv_class_init(GstDxMsgConvClass *klass) {
             "Flag whether to include frame data as base64 JPEG in the message. (optional).",
             FALSE, G_PARAM_READWRITE));
 
+    g_object_class_install_property(
+        gobject_class, static_cast<guint>(PropertyID::PROP_NODE_ID),
+        g_param_spec_string(
+            "node-id", "Node ID",
+            "Edge-global node identifier emitted in each message as 'node_id'. "
+            "(optional).",
+            nullptr, G_PARAM_READWRITE));
+
+    g_object_class_install_property(
+        gobject_class, static_cast<guint>(PropertyID::PROP_PAYLOAD_TYPE),
+        g_param_spec_enum(
+            "payload-type", "Payload Type",
+            "Serialization format the custom convert library should emit. "
+            "(optional).",
+            DX_TYPE_PAYLOAD_TYPE, DX_PAYLOAD_TYPE_JSON, G_PARAM_READWRITE));
+
     GstCaps *video_caps = gst_caps_from_string(
         DX_VIDEORAW_CAPS_STR "; "
         "video/x-raw, format=(string){ NV12, I420, RGB, BGR }");
@@ -216,6 +250,8 @@ static void gst_dxmsgconv_class_init(GstDxMsgConvClass *klass) {
         GST_BASE_TRANSFORM_CLASS(klass);
     base_transform_class->set_caps =
         GST_DEBUG_FUNCPTR(gst_dxmsgconv_set_caps);
+    base_transform_class->sink_event =
+        GST_DEBUG_FUNCPTR(gst_dxmsgconv_sink_event);
     base_transform_class->start = GST_DEBUG_FUNCPTR(gst_dxmsgconv_start);
     base_transform_class->stop = GST_DEBUG_FUNCPTR(gst_dxmsgconv_stop);
     base_transform_class->transform_ip =
@@ -241,6 +277,8 @@ static void gst_dxmsgconv_init(GstDxMsgConv *self) {
 
     self->_config_file_path = nullptr;
     self->_library_file_path = nullptr;
+    self->_node_id = nullptr;
+    self->_payload_type = DX_PAYLOAD_TYPE_JSON;
     self->_library_handle = nullptr;
     self->_message_interval = 1;
     self->_include_frame = FALSE;
@@ -291,6 +329,9 @@ static gboolean gst_dxmsgconv_start(GstBaseTransform *trans) {
     }
 
     self->_context = self->_create_context_function();
+    if (self->_context) {
+        self->_context->_payload_type = self->_payload_type;
+    }
 
     return TRUE;
 }
@@ -412,6 +453,21 @@ void convert(GstDxMsgConv *self, DXFrameMeta *frame_meta, GstBuffer *buf) {
         meta_info._input_info = &self->_input_info;
         meta_info._include_frame = self->_include_frame;
         meta_info._frame_base64 = nullptr;
+        meta_info._node_id = self->_node_id;
+
+        // Native frame timestamps: buffer PTS (always available) and the
+        // wall-clock NTP capture time carried by GstReferenceTimestampMeta
+        // (populated upstream by e.g. rtspsrc add-reference-timestamp-meta).
+        GstClockTime pts = GST_BUFFER_PTS(buf);
+        meta_info._pts_ns =
+            GST_CLOCK_TIME_IS_VALID(pts) ? (gint64)pts : -1;
+
+        meta_info._ntp_timestamp_ns = -1;
+        GstReferenceTimestampMeta *ref_meta =
+            gst_buffer_get_reference_timestamp_meta(buf, nullptr);
+        if (ref_meta && GST_CLOCK_TIME_IS_VALID(ref_meta->timestamp)) {
+            meta_info._ntp_timestamp_ns = (gint64)ref_meta->timestamp;
+        }
 
         gchar *base64_str = nullptr;
         if (self->_include_frame && self->_kernel_pool) {
@@ -444,6 +500,7 @@ void convert(GstDxMsgConv *self, DXFrameMeta *frame_meta, GstBuffer *buf) {
         dx_add_payload_to_buffer(buf, payload);
 
         g_free(payload->_data);
+        g_free(payload->_key);
         g_free(payload);
         g_free(base64_str);
 
@@ -484,6 +541,30 @@ static gboolean gst_dxmsgconv_set_caps(GstBaseTransform *trans,
                     self->_cached_width, self->_cached_height,
                     gst_video_format_to_string(self->_cached_format));
     return TRUE;
+}
+
+// ---------------------------------------------------------------------------
+// sink_event — per-stream lifecycle eviction (CLAUDE.md C.5 / E.6)
+// ---------------------------------------------------------------------------
+// dxinputselector emits an L2 wrapped per-stream EOS when a single stream ends.
+// Erase that stream's sequence counter so the slot does not leak and a later
+// buffer reusing the same stream_id starts fresh. The event is then forwarded.
+static gboolean gst_dxmsgconv_sink_event(GstBaseTransform *trans,
+                                         GstEvent *event) {
+    GstDxMsgConv *self = GST_DXMSGCONV(trans);
+
+    if (dx_event_is_wrapped_downstream(event)) {
+        gint stream_id = -1;
+        GstEvent *inner = dx_event_peek_inner(event, &stream_id);
+        if (inner && GST_EVENT_TYPE(inner) == GST_EVENT_EOS) {
+            self->_seq_ids.erase(stream_id);
+            GST_DEBUG_OBJECT(self,
+                             "Per-stream EOS: evicted seq state for stream %d",
+                             stream_id);
+        }
+    }
+
+    return GST_BASE_TRANSFORM_CLASS(parent_class)->sink_event(trans, event);
 }
 
 static GstFlowReturn gst_dxmsgconv_transform_ip(GstBaseTransform *trans,

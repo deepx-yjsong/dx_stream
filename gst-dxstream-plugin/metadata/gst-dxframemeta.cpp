@@ -86,6 +86,7 @@ static gboolean dx_frame_meta_init(GstMeta *meta, gpointer params,
     // Initialize C++ objects with placement new
     new (&dx_meta->_format) std::string();
     new (&dx_meta->_name) std::string();
+    new (&dx_meta->_sensor_id) std::string();
     new (&dx_meta->_object_meta_list) std::vector<DXObjectMeta*>();
     new (&dx_meta->_frame_user_meta_list) std::vector<DXUserMeta*>();
     new (&dx_meta->_input_tensors) std::map<int, dxs::DXTensors>();
@@ -123,6 +124,7 @@ static void dx_frame_meta_free(GstMeta *meta, GstBuffer *buffer) {
     // so destructors must be called explicitly before GStreamer frees the memory
     dx_meta->_format.~basic_string(); // NOSONAR
     dx_meta->_name.~basic_string(); // NOSONAR
+    dx_meta->_sensor_id.~basic_string(); // NOSONAR
     dx_meta->_label_name.~basic_string(); // NOSONAR
     dx_meta->_object_meta_list.~vector(); // NOSONAR
     dx_meta->_frame_user_meta_list.~vector(); // NOSONAR
@@ -148,6 +150,7 @@ void dx_frame_meta_copy(GstBuffer *src_buffer, DXFrameMeta *src_frame_meta,
     GST_CAT_DEBUG_SAFE(dxmeta_cat, "Copying DXFrameMeta");
 
     dst_frame_meta->_stream_id = src_frame_meta->_stream_id;
+    dst_frame_meta->_sensor_id = src_frame_meta->_sensor_id;
     dst_frame_meta->_width = src_frame_meta->_width;
     dst_frame_meta->_height = src_frame_meta->_height;
     dst_frame_meta->_frame_rate = src_frame_meta->_frame_rate;

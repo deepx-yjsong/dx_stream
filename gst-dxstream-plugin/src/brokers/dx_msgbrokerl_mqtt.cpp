@@ -312,7 +312,9 @@ DxMsg_Bal_Handle_t dxmsg_bal_connect_mqtt(char *conn_info, char *cfg_path) {
 }
 
 DxMsg_Bal_Error_t dxmsg_bal_send_mqtt(DxMsg_Bal_Handle_t handle, const char *topic,
+                                      const char *key,
                                       const void *payload, int payload_len) {
+    std::ignore = key;  // MQTT does not use partition keys.
     auto *pClient = (MqttClientInfo_t *)handle;
     DxMsg_Bal_Error_t balError = DxMsg_Bal_Error::DXMSG_BAL_OK;
     int rc;

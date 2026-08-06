@@ -6,6 +6,10 @@
 #include "gstdxstream/gst-dxframemeta.hpp"
 #include "gstdxstream/gst-dxobjectmeta.hpp"
 
+#ifdef DX_MSGCONVL_WITH_PROTOBUF
+#include "dx_frame.pb.h"
+#endif
+
 DxMsgContextPriv *dxcontext_create_contextPriv(void) {
     auto *contextPriv = g_new0(DxMsgContextPriv, 1);
     return contextPriv;
@@ -153,6 +157,10 @@ static void add_object_meta_to_json(JsonArray *jarray_objects,
  *   "seqId": 123,
  *   "width": 1920,
  *   "height": 1080,
+ *   "sensor_id": "cam01",
+ *   "node_id": "edge-001",
+ *   "pts_ns": 1234567890,
+ *   "ntp_timestamp_ns": 1719500000000000000,
  *   "objects": [
  *     {
  *       "object": {
@@ -219,6 +227,27 @@ gchar *dxpayload_convert_to_json(DxMsgContext *context,
     json_object_set_int_member(jobj_root, "width", frame_meta->_width);
     json_object_set_int_member(jobj_root, "height", frame_meta->_height);
 
+    // Stable identities (B2). sensor_id is the per-stream camera identity
+    // stamped on DXFrameMeta by dxinputselector; node_id is the edge-global
+    // identifier configured via the dxmsgconv "node-id" property. Both are
+    // emitted only when set (non-empty / non-null).
+    if (!frame_meta->_sensor_id.empty()) {
+        json_object_set_string_member(jobj_root, "sensor_id",
+                                      frame_meta->_sensor_id.c_str());
+    }
+    if (meta_info->_node_id && meta_info->_node_id[0] != '\0') {
+        json_object_set_string_member(jobj_root, "node_id",
+                                      meta_info->_node_id);
+    }
+
+    // Frame capture timestamps (native, Phase 1B). pts_ns is the buffer PTS;
+    // ntp_timestamp_ns is the wall-clock capture time when available (>= 0).
+    json_object_set_int_member(jobj_root, "pts_ns", meta_info->_pts_ns);
+    if (meta_info->_ntp_timestamp_ns >= 0) {
+        json_object_set_int_member(jobj_root, "ntp_timestamp_ns",
+                                   meta_info->_ntp_timestamp_ns);
+    }
+
     if (meta_info->_frame_base64) {
         json_object_set_string_member(jobj_root, "frameData",
                                       meta_info->_frame_base64);
@@ -239,3 +268,82 @@ gchar *dxpayload_convert_to_json(DxMsgContext *context,
 
     return json_data;
 }
+
+#ifndef DX_MSGCONVL_WITH_PROTOBUF
+
+// Built without the protobuf backend. Keep the symbol so dx_msgconvl.cpp links
+// unchanged, and fail loudly instead of silently emitting nothing: the caller
+// treats nullptr as "conversion failed" and drops the buffer.
+void *dxpayload_convert_to_protobuf(DxMsgContext *context,
+                                    GstDxMsgMetaInfo *meta_info,
+                                    size_t *out_size) {
+    std::ignore = context;
+    std::ignore = meta_info;
+    std::ignore = out_size;
+    g_warning("payload-type=protobuf requested but dx_msgconvl was built "
+              "without protobuf support. Install libprotobuf-dev and "
+              "protobuf-compiler, then reconfigure with -Dprotobuf=enabled.");
+    return nullptr;
+}
+
+#else
+
+void *dxpayload_convert_to_protobuf(DxMsgContext *context,
+                                    GstDxMsgMetaInfo *meta_info,
+                                    size_t *out_size) {
+    std::ignore = context;
+    const auto *frame_meta = (DXFrameMeta *)(meta_info->_frame_meta);
+
+    dxargus::SensorFrame frame;
+    frame.set_sensor_id(frame_meta->_sensor_id);
+    if (meta_info->_node_id && meta_info->_node_id[0] != '\0') {
+        frame.set_node_id(meta_info->_node_id);
+    }
+    frame.set_stream_id(frame_meta->_stream_id);
+    frame.set_seq_id(meta_info->_seq_id);
+    frame.set_width(frame_meta->_width);
+    frame.set_height(frame_meta->_height);
+    frame.set_pts_ns(meta_info->_pts_ns);
+    frame.set_ntp_timestamp_ns(meta_info->_ntp_timestamp_ns);
+
+    for (const auto obj_meta : frame_meta->_object_meta_list) {
+        if (obj_meta->_label == -1) {
+            continue;
+        }
+        dxargus::Detection *det = frame.add_objects();
+        det->set_label_id(obj_meta->_label);
+        det->set_track_id(obj_meta->_track_id);
+        det->set_confidence(obj_meta->_confidence);
+        det->set_name(obj_meta->_label_name);
+        dxargus::BBox *box = det->mutable_box();
+        box->set_start_x(obj_meta->_box[0]);
+        box->set_start_y(obj_meta->_box[1]);
+        box->set_end_x(obj_meta->_box[2]);
+        box->set_end_y(obj_meta->_box[3]);
+        if (!obj_meta->_keypoints.empty()) {
+            size_t n = obj_meta->_keypoints.size() / 3;
+            for (size_t k = 0; k < n; ++k) {
+                dxargus::Keypoint *kp = det->add_keypoints();
+                kp->set_x(obj_meta->_keypoints[k * 3 + 0]);
+                kp->set_y(obj_meta->_keypoints[k * 3 + 1]);
+                kp->set_score(obj_meta->_keypoints[k * 3 + 2]);
+            }
+        }
+    }
+
+    size_t size = frame.ByteSizeLong();
+    // g_malloc(0) returns NULL, and the caller reads NULL as "conversion
+    // failed" and drops the buffer. A frame whose every field happens to hold
+    // the proto3 default serializes to zero bytes, so allocate at least one
+    // byte to keep an empty-but-valid message distinguishable from an error.
+    void *buf = g_malloc(size ? size : 1);
+    if (!frame.SerializeToArray(buf, (int)size)) {
+        g_warning("SensorFrame SerializeToArray failed (size=%zu)", size);
+        g_free(buf);
+        return nullptr;
+    }
+    *out_size = size;
+    return buf;
+}
+
+#endif  // DX_MSGCONVL_WITH_PROTOBUF

@@ -20,6 +20,7 @@ struct _DXFrameMeta {
     GstMeta _meta;
     
     int _stream_id;
+    std::string _sensor_id;  // stable per-stream identity (B2). _stream_id is positional.
     int _width;
     int _height;
     std::string _format;

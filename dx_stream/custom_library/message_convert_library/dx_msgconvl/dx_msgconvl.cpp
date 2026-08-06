@@ -1,4 +1,5 @@
 #include "dx_msgconvl_priv.hpp"
+#include "gstdxstream/gst-dxframemeta.hpp"
 #include <glib.h>
 #include <stddef.h>
 #include <string.h>
@@ -28,10 +29,38 @@ DX_CUSTOM_EXPORT DxMsgPayload *dxmsg_convert_payload(DxMsgContext *context,
         return nullptr;
     }
 
-    gchar *json_data = dxpayload_convert_to_json(context, meta_info);
+    // Derive the broker partition key (native sensor_id, ADR-023/024) for both
+    // serialization formats. nullptr when unset.
+    const auto *fm = (DXFrameMeta *)meta_info->_frame_meta;
+    if (fm && !fm->_sensor_id.empty()) {
+        payload->_key = g_strdup(fm->_sensor_id.c_str());
+    }
 
+    if (context && context->_payload_type == DX_PAYLOAD_TYPE_PROTOBUF) {
+        size_t pb_size = 0;
+        void *pb_data = dxpayload_convert_to_protobuf(context, meta_info, &pb_size);
+        if (!pb_data) {
+            g_warning("dxpayload_convert_to_protobuf returned null");
+            g_free(payload->_key);
+            g_free(payload);
+            return nullptr;
+        }
+        if (pb_size > G_MAXUINT) {
+            g_warning("Protobuf data size (%zu bytes) exceeds maximum guint value", pb_size);
+            g_free(pb_data);
+            g_free(payload->_key);
+            g_free(payload);
+            return nullptr;
+        }
+        payload->_size = (guint)pb_size;
+        payload->_data = pb_data;
+        return payload;
+    }
+
+    gchar *json_data = dxpayload_convert_to_json(context, meta_info);
     if (json_data == nullptr) {
         g_warning("dxpayload_convert_to_json returned null");
+        g_free(payload->_key);
         g_free(payload);
         return nullptr;
     }
@@ -42,6 +71,7 @@ DX_CUSTOM_EXPORT DxMsgPayload *dxmsg_convert_payload(DxMsgContext *context,
                   "within the checked limit.",
                   MAX_EXPECTED_JSON_SIZE);
         g_free(json_data);
+        g_free(payload->_key);
         g_free(payload);
         return nullptr;
     }
@@ -49,6 +79,7 @@ DX_CUSTOM_EXPORT DxMsgPayload *dxmsg_convert_payload(DxMsgContext *context,
     if (json_len > G_MAXUINT) {
         g_warning("JSON data size (%zu bytes) exceeds maximum guint value", json_len);
         g_free(json_data);
+        g_free(payload->_key);
         g_free(payload);
         return nullptr;
     }

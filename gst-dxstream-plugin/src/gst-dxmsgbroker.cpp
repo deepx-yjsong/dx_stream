@@ -294,6 +294,7 @@ static GstFlowReturn gst_dxmsgbroker_render(GstBaseSink *sink,
         GST_LOG_OBJECT(self, "Publishing message (%u bytes) to topic: %s",
                          payload->_size, topic);
         DxMsg_Bal_Error_t error = self->_send_function(self->_handle, topic,
+                                     payload->_key,
                                      payload->_data, payload->_size);
         if (error != DxMsg_Bal_Error::DXMSG_BAL_OK) {
             self->_consecutive_failures++;

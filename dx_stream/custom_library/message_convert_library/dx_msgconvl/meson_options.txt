@@ -1,0 +1,7 @@
+option('protobuf',
+    type : 'feature',
+    value : 'auto',
+    description : 'Build the Protocol Buffers payload backend (payload-type=protobuf). ' +
+                  'Requires libprotobuf and protoc. With the default "auto" the ' +
+                  'backend is built only when both are present, so JSON-only users ' +
+                  'need no extra dependency.')

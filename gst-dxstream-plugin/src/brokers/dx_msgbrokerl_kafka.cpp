@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstring>
 #include <fstream>
 #include <map>
 #include <sstream>
@@ -279,6 +280,7 @@ DxMsg_Bal_Handle_t dxmsg_bal_connect_kafka(char *conn_info, char *cfg_path) {
 }
 
 DxMsg_Bal_Error_t dxmsg_bal_send_kafka(DxMsg_Bal_Handle_t handle, const char *topic,
+                                       const char *key,
                                        const void *payload, int payload_len) {
     auto *pClient = (KafkaClientInfo_t *)handle;
     DxMsg_Bal_Error_t balError = DxMsg_Bal_Error::DXMSG_BAL_OK;
@@ -291,11 +293,20 @@ DxMsg_Bal_Error_t dxmsg_bal_send_kafka(DxMsg_Bal_Handle_t handle, const char *to
         return DxMsg_Bal_Error::DXMSG_BAL_ERR_INVALID;
     }
 
-    err = rd_kafka_producev(
-        pClient->_rk, RD_KAFKA_V_TOPIC(topic),
-        RD_KAFKA_V_MSGFLAGS(RD_KAFKA_MSG_F_COPY),
-        RD_KAFKA_V_VALUE((void *)payload, payload_len),
-        RD_KAFKA_V_OPAQUE(nullptr), RD_KAFKA_V_END);
+    if (key != nullptr && key[0] != '\0') {
+        err = rd_kafka_producev(
+            pClient->_rk, RD_KAFKA_V_TOPIC(topic),
+            RD_KAFKA_V_MSGFLAGS(RD_KAFKA_MSG_F_COPY),
+            RD_KAFKA_V_KEY(key, strlen(key)),
+            RD_KAFKA_V_VALUE((void *)payload, payload_len),
+            RD_KAFKA_V_OPAQUE(nullptr), RD_KAFKA_V_END);
+    } else {
+        err = rd_kafka_producev(
+            pClient->_rk, RD_KAFKA_V_TOPIC(topic),
+            RD_KAFKA_V_MSGFLAGS(RD_KAFKA_MSG_F_COPY),
+            RD_KAFKA_V_VALUE((void *)payload, payload_len),
+            RD_KAFKA_V_OPAQUE(nullptr), RD_KAFKA_V_END);
+    }
     if (err) {
         if (err == RD_KAFKA_RESP_ERR__QUEUE_FULL) {
             GST_WARNING("Queue full, discarding message...");

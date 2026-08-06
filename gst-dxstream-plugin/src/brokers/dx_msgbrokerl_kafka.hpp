@@ -5,6 +5,7 @@
 
 DxMsg_Bal_Handle_t dxmsg_bal_connect_kafka(char *conn_info, char *cfg_file);
 DxMsg_Bal_Error_t dxmsg_bal_send_kafka(DxMsg_Bal_Handle_t handle, const char *topic,
+                                       const char *key,
                                        const void *payload, int payload_len);
 DxMsg_Bal_Error_t dxmsg_bal_disconnect_kafka(DxMsg_Bal_Handle_t handle);
 

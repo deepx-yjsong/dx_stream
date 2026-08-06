@@ -387,6 +387,43 @@ GST_START_TEST(CE_inputsel_caps_wrapping) {
 }
 GST_END_TEST;
 
+// CE_inputsel_sensor_id_stamp: set-sensor-id action signal → clip() stamps _sensor_id
+// Target: gst_dxinputselector_set_sensor_id + _sensor_ids map + clip() stamp
+// MUT: remove stamp in clip() → _sensor_id stays empty
+GST_START_TEST(CE_inputsel_sensor_id_stamp) {
+    AggPipe p = make_agg_pipe("dxinputselector", 2);
+    g_signal_emit_by_name(p.agg, "set-sensor-id", 0u, "cam01");
+    g_signal_emit_by_name(p.agg, "set-sensor-id", 1u, "cam02");
+    p.start();
+
+    p.push(0, make_buf(100 * GST_MSECOND));
+    p.push(1, make_buf(200 * GST_MSECOND));
+
+    GstSample *s = p.pull();
+    fail_unless(s != nullptr, "first output must arrive");
+    DXFrameMeta *fm = dx_get_frame_meta(gst_sample_get_buffer(s));
+    fail_unless(fm != nullptr);
+    fail_unless_equals_int(fm->_stream_id, 0);
+    fail_unless_equals_string(fm->_sensor_id.c_str(), "cam01");
+    gst_sample_unref(s);
+
+    // src0 drained → push more so aggregate can advance to src1's 200ms (min logic)
+    p.push(0, make_buf(300 * GST_MSECOND));
+
+    s = p.pull();
+    fail_unless(s != nullptr, "second output must arrive");
+    fm = dx_get_frame_meta(gst_sample_get_buffer(s));
+    fail_unless(fm != nullptr);
+    fail_unless_equals_int(fm->_stream_id, 1);
+    fail_unless_equals_string(fm->_sensor_id.c_str(), "cam02");
+    gst_sample_unref(s);
+
+    p.eos(0);
+    p.eos(1);
+    p.stop();
+}
+GST_END_TEST;
+
 static Suite *dxinputselector_suite(void) {
     Suite *s = suite_create("dxinputselector");
     TCase *tc = tcase_create("contract");
@@ -402,6 +439,7 @@ static Suite *dxinputselector_suite(void) {
     tcase_add_test(tc, CE_inputsel_min_pts_order);
     tcase_add_test(tc, CE_inputsel_per_stream_wrapped_eos);
     tcase_add_test(tc, CE_inputsel_caps_wrapping);
+    tcase_add_test(tc, CE_inputsel_sensor_id_stamp);
     return s;
 }
 

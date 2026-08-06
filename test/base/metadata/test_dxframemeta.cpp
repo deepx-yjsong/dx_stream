@@ -37,6 +37,7 @@ GST_START_TEST(TC1_init_defaults) {
     fail_unless(fm->_format.empty());
     fail_unless(fm->_name.empty());
     fail_unless(fm->_label_name.empty());
+    fail_unless(fm->_sensor_id.empty());
     fail_unless_equals_int((int)fm->_object_meta_list.size(), 0);
     fail_unless_equals_int((int)fm->_frame_user_meta_list.size(), 0);
     fail_unless_equals_int((int)fm->_seg_data.size(), 0);
@@ -320,6 +321,21 @@ GST_START_TEST(TC16_free_releases_children) {
 }
 GST_END_TEST;
 
+// ---- TC17: _sensor_id copied on buffer copy (B2) ----
+GST_START_TEST(TC17_copy_sensor_id) {
+    GstBuffer *buf = fresh_buf();
+    DXFrameMeta *src = dx_get_frame_meta(buf);
+    src->_sensor_id = "cam01";
+
+    GstBuffer *dup = gst_buffer_copy(buf);
+    DXFrameMeta *dst = dx_get_frame_meta(dup);
+    fail_unless(dst != nullptr);
+    fail_unless_equals_string(dst->_sensor_id.c_str(), "cam01");
+    gst_buffer_unref(buf);
+    gst_buffer_unref(dup);
+}
+GST_END_TEST;
+
 static Suite *dxframemeta_suite(void) {
     Suite *s = suite_create("dxframemeta");
     TCase *tc = tcase_create("contract");
@@ -340,6 +356,7 @@ static Suite *dxframemeta_suite(void) {
     tcase_add_test(tc, TC14_copy_seg_nonempty);
     tcase_add_test(tc, TC15_transform_skips_if_exists);
     tcase_add_test(tc, TC16_free_releases_children);
+    tcase_add_test(tc, TC17_copy_sensor_id);
     return s;
 }
 

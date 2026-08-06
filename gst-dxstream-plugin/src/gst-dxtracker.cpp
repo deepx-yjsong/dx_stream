@@ -273,6 +273,21 @@ static gboolean gst_dxtracker_sink_event(GstBaseTransform *trans,
         self->_trackers.clear();
     }
 
+    // Per-stream lifecycle (CLAUDE.md C.5 / E.6): dxinputselector emits an L2
+    // wrapped per-stream EOS when a single stream ends. Erase that stream's
+    // tracker instance so it does not leak and a later buffer reusing the same
+    // stream_id gets a fresh OC_SORT instance (no stale tracks). The event is
+    // then forwarded downstream.
+    if (dx_event_is_wrapped_downstream(event)) {
+        gint stream_id = -1;
+        GstEvent *inner = dx_event_peek_inner(event, &stream_id);
+        if (inner && GST_EVENT_TYPE(inner) == GST_EVENT_EOS) {
+            self->_trackers.erase(stream_id);
+            GST_DEBUG_OBJECT(self, "Per-stream EOS: evicted tracker for stream %d",
+                             stream_id);
+        }
+    }
+
     return GST_BASE_TRANSFORM_CLASS(parent_class)->sink_event(trans, event);
 }
 

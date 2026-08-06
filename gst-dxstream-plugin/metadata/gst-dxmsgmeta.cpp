@@ -4,6 +4,23 @@
 
 GST_DEBUG_CATEGORY_EXTERN(dxmeta_cat);
 
+// GType for the "payload-type" property. Registering a real enum (instead of an
+// int range) makes gst-inspect self-documenting and makes out-of-range values
+// impossible to set, so a typo cannot silently fall back to JSON.
+GType dx_payload_type_get_type(void) {
+    static gsize type_id_once = 0;
+    if (g_once_init_enter(&type_id_once)) {
+        static const GEnumValue values[] = {
+            {DX_PAYLOAD_TYPE_JSON, "JSON payload", "json"},
+            {DX_PAYLOAD_TYPE_PROTOBUF, "Protocol Buffers payload", "protobuf"},
+            {0, nullptr, nullptr},
+        };
+        GType type_id = g_enum_register_static("DxPayloadType", values);
+        g_once_init_leave(&type_id_once, type_id);
+    }
+    return (GType)type_id_once;
+}
+
 #define GST_CAT_DEBUG_SAFE(cat, ...) \
     G_STMT_START { \
         if (cat) { \
@@ -79,6 +96,7 @@ static void gst_dxmsg_meta_free(GstMeta *meta, GstBuffer *buffer) {
     if (payload) {
         GST_CAT_DEBUG_SAFE(dxmeta_cat, "Freeing payload data (size=%u)", payload->_size);
         g_free(payload->_data);
+        g_free(payload->_key);
         g_free(payload);
         payload = nullptr;
     }
@@ -106,6 +124,7 @@ static gboolean gst_dxmsg_meta_transform(GstBuffer *dest, GstMeta *meta,
         auto *dst_payload = g_new0(DxMsgPayload, 1);
         dst_payload->_data = g_memdup(src_payload->_data, src_payload->_size);
         dst_payload->_size = src_payload->_size;
+        dst_payload->_key = src_payload->_key ? g_strdup(src_payload->_key) : nullptr;
         dst_msg_meta->_payload = (gpointer)dst_payload;
     } else {
         dst_msg_meta->_payload = nullptr;
@@ -140,6 +159,7 @@ void dx_add_payload_to_buffer(GstBuffer *buffer, const DxMsgPayload *payload) {
     auto *msgPayload = g_new0(DxMsgPayload, 1);
     msgPayload->_data = g_memdup(payload->_data, payload->_size);
     msgPayload->_size = payload->_size;
+    msgPayload->_key = payload->_key ? g_strdup(payload->_key) : nullptr;
 
     msg_meta->_payload = (gpointer)msgPayload;
 }

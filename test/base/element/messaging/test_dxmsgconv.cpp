@@ -11,6 +11,7 @@
 #include "npu_env.hpp"
 
 #include <cstring>
+#include <string>
 
 using namespace dxtest;
 
@@ -202,6 +203,39 @@ GST_START_TEST(CE_msgconv_payload_attached) {
 }
 GST_END_TEST;
 
+// CE_msgconv_timestamp_emitted: buffer PTS is emitted as pts_ns in payload JSON
+// Target: convert() populates meta_info._pts_ns from GST_BUFFER_PTS, dxpayload_convert_to_json emits it
+// MUT: drop pts_ns population/emit → field absent from payload
+GST_START_TEST(CE_msgconv_timestamp_emitted) {
+    GstElement *e = gst_element_factory_make("dxmsgconv", nullptr);
+    g_object_set(e, "library-file-path", MSGCONV_LIB, nullptr);
+    GstHarness *h = gst_harness_new_with_element(e, "sink", "src");
+    gst_harness_set_src_caps_str(h, CAPS_STR);
+
+    const GstClockTime kPts = 1234567890ULL;
+    GstBuffer *in = make_buf_with_meta(kPts, 0, 1);
+    fail_unless_equals_int(gst_harness_push(h, in), GST_FLOW_OK);
+
+    GstBuffer *out = gst_harness_pull(h);
+    fail_unless(out != nullptr, "output buffer must arrive");
+    GstDxMsgMeta *mm = (GstDxMsgMeta *)gst_buffer_get_meta(
+        out, gst_dxmsg_meta_api_get_type());
+    fail_unless(mm != nullptr && mm->_payload != nullptr,
+                "payload must be attached");
+    DxMsgPayload *pl = (DxMsgPayload *)mm->_payload;
+    std::string json((const char *)pl->_data, pl->_size);
+
+    fail_unless(json.find("pts_ns") != std::string::npos,
+                "payload JSON must contain pts_ns field");
+    fail_unless(json.find("1234567890") != std::string::npos,
+                "pts_ns must carry the buffer PTS value");
+
+    gst_buffer_unref(out);
+    gst_harness_teardown(h);
+    gst_object_unref(e);
+}
+GST_END_TEST;
+
 // CE_msgconv_message_interval: message-interval=3 → only every 3rd buffer is converted
 // Target: convert() L383-384 (seq_id % message_interval)
 // MUT: remove L383 condition → all buffers converted
@@ -284,6 +318,7 @@ static Suite *dxmsgconv_suite(void) {
     tcase_add_test(tc, CE_msgconv_bad_config_path_uses_properties);
     tcase_add_test(tc, CE_msgconv_no_meta_passthrough);
     tcase_add_test(tc, CE_msgconv_payload_attached);
+    tcase_add_test(tc, CE_msgconv_timestamp_emitted);
     tcase_add_test(tc, CE_msgconv_message_interval);
     tcase_add_test(tc, CE_msgconv_dlclose_reopen);
     tcase_add_test(tc, CE_msgconv_config_loads_properties);

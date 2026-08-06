@@ -32,6 +32,7 @@ using DxMsg_Bal_ConnectFptr_t = DxMsg_Bal_Handle_t (*)(char *conn_info,
                                                         char *cfg_path);
 using DxMsg_Bal_SendFptr_t = DxMsg_Bal_Error_t (*)(DxMsg_Bal_Handle_t handle,
                                                     const char *topic,
+                                                    const char *key,
                                                     const void *payload,
                                                     int payload_len);
 using DxMsg_Bal_DisconnectFptr_t = DxMsg_Bal_Error_t (*)(
