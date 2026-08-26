@@ -74,14 +74,37 @@ void KalmanFilterNew::freeze() {
     attr_saved.P_prior = P_prior;
     attr_saved.x_post = x_post;
     attr_saved.P_post = P_post;
-    attr_saved.history_obs = history_obs;
+    attr_saved.history_obs_len = history_obs.size();
 }
 void KalmanFilterNew::unfreeze() {
     if (!attr_saved.IsInitialized) {
         return;
     }
 
-    new_history = history_obs;
+    // 가상 궤적 생성에 필요한 것은 "가장 최근 실관측 두 건과 그 사이 프레임 수" 뿐이다.
+    // 업스트림은 이 값을 리스트 별칭(new_history = self.history_obs,
+    // noahcao/OC_SORT kalmanfilter.py:421)으로 읽고, 호출이 끝나면 별칭이 사라진다 —
+    // 복사가 아니다. 이식은 이것을 멤버에 대한 전량 깊은 복사로 바꿔 트랙 수명 내내
+    // 이력 사본을 하나 더 들고 있었다. 되감기 전에 제자리에서 읽으면 내용은 같고 복사는 없다.
+    int lastNotNullIndex = -1;
+    int secondLastNotNullIndex = -1;
+    Eigen::VectorXf box1;
+    Eigen::VectorXf box2;
+
+    for (int i = static_cast<int>(history_obs.size()) - 1; i >= 0; --i) {
+        if (history_obs[i].size() == 0) {
+            continue;
+        }
+        if (lastNotNullIndex == -1) {
+            lastNotNullIndex = i;
+            box2 = history_obs[i];
+        } else if (secondLastNotNullIndex == -1) {
+            secondLastNotNullIndex = i;
+            box1 = history_obs[i];
+            break;
+        }
+    }
+
     x = attr_saved.x;
     P = attr_saved.P;
     Q = attr_saved.Q;
@@ -100,28 +123,19 @@ void KalmanFilterNew::unfreeze() {
     P_prior = attr_saved.P_prior;
     x_post = attr_saved.x_post;
 
-    if (!history_obs.empty()) {
-        history_obs.pop_back();
+    // 이력을 동결 시점 스냅샷에서 마지막 한 건을 뺀 상태로 되감는다(업스트림 :424 + :426).
+    // 공백 구간에 쌓인 비관측 항목이 여기서 버려지므로 이력이 공백마다 늘어나지 않는다.
+    // 스냅샷이 접두이므로(위 history_obs_len 주석의 불변식) resize 가 곧 되감기다 —
+    // 복사도, 보관도 없다. 이식은 되감기 없이 현재 이력에서 한 건만 빼고 스냅샷을 영구
+    // 보관해, 트랙 하나가 전량 이력을 셋(현재 + new_history + 스냅샷) 들고 있었다.
+    // history_obs_len = 0 은 업스트림의 attr_saved = None(:425) 에 해당한다.
+    if (attr_saved.history_obs_len > 0) {
+        history_obs.resize(attr_saved.history_obs_len - 1);
+    } else {
+        history_obs.clear();
     }
-
-    int lastNotNullIndex = -1;
-    int secondLastNotNullIndex = -1;
-    Eigen::VectorXf box1;
-    Eigen::VectorXf box2;
-
-    for (int i = static_cast<int>(new_history.size()) - 1; i >= 0; --i) {
-        if (new_history[i].size() == 0) {
-            continue;
-        }
-        if (lastNotNullIndex == -1) {
-            lastNotNullIndex = i;
-            box2 = new_history[i];
-        } else if (secondLastNotNullIndex == -1) {
-            secondLastNotNullIndex = i;
-            box1 = new_history[i];
-            break;
-        }
-    }
+    attr_saved.history_obs_len = 0;
+    attr_saved.IsInitialized = false;
 
     if (lastNotNullIndex == -1 || secondLastNotNullIndex == -1) {
         return;

@@ -83,8 +83,6 @@ class KalmanFilterNew {
     // Used to mark the tracking state (whether there is still a target matching
     // this trajectory), default value is false.
     bool observed = false;
-    std::vector<Eigen::VectorXf>
-        new_history; // Used to create a virtual trajectory.
 
     struct Data {
         Eigen::VectorXf x;
@@ -105,7 +103,14 @@ class KalmanFilterNew {
         Eigen::MatrixXf P_prior;
         Eigen::VectorXf x_post;
         Eigen::MatrixXf P_post;
-        std::vector<Eigen::VectorXf> history_obs;
+        // 동결 시점의 이력 길이. 업스트림은 여기서 리스트를 얕게 복사하지만
+        // (list(self.history_obs), kalmanfilter.py:407 — 원소는 공유되고 포인터만 복사)
+        // C++ 로 그대로 옮기면 Eigen 벡터 n개를 깊은 복사하게 되고, 깜빡이는 트랙에서는
+        // 공백마다 그 비용을 다시 낸다(측정: 깜빡임 주기 4프레임에서 프레임당 비용이
+        // 트랙 수명에 따라 3.18배 증가). 동결과 해동 사이 history_obs 는 추가만 되므로
+        // (KalmanFilterNew::update 의 push_back 이 유일한 변경) 스냅샷은 접두
+        // history_obs[0, history_obs_len) 과 정확히 같다 — 길이만 기억하면 복사가 없다.
+        size_t history_obs_len = 0;
         bool observed = false;
         // The following is to determine whether the data has been saved due to
         // freezing.
