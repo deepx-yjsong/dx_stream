@@ -49,7 +49,15 @@ class KalmanBoxTracker {
     int idx;
     Eigen::RowVectorXf last_observation = Eigen::RowVectorXf::Zero(5);
     std::unordered_map<int, Eigen::VectorXf> observations;
-    std::vector<Eigen::VectorXf> history_observations;
+    // The reference implementation keeps a `history_observations` list alongside
+    // `observations`; it is deliberately not ported. Its only consumer there is
+    // Head Padding (noahcao/OC_SORT ocsort.py:416), which cannot be expressed in
+    // this output contract: rows have no frame-offset column and their last field
+    // indexes the CURRENT frame's detection list, while dxtracker edits buffers in
+    // place and has already forwarded the earlier ones. Storing it here cost 20 MB
+    // per 12-hour track at 10 fps and was never read. If Head Padding is ever
+    // implemented, note that it reads only indices -2 and -3, so `min_hits`
+    // entries suffice -- it does not need to be unbounded.
     Eigen::RowVectorXf velocity = Eigen::RowVectorXf::Zero(2); // [2,1]
     int delta_t;
 };

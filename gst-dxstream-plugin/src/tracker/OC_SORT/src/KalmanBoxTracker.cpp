@@ -69,7 +69,6 @@ void KalmanBoxTracker::update(Eigen::VectorXf *bbox_, int cls_, int idx_) {
 
     last_observation = *bbox_;
     observations[age] = *bbox_;
-    history_observations.push_back(*bbox_);
     time_since_update = 0;
     history.clear();
     hits += 1;
