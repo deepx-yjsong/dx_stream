@@ -110,6 +110,9 @@ class KalmanFilterNew {
         // 트랙 수명에 따라 3.18배 증가). 동결과 해동 사이 history_obs 는 추가만 되므로
         // (KalmanFilterNew::update 의 push_back 이 유일한 변경) 스냅샷은 접두
         // history_obs[0, history_obs_len) 과 정확히 같다 — 길이만 기억하면 복사가 없다.
+        // 0 이 "동결 당시 비어 있었다" 와 "freeze() 가 없었다" 로 갈리지 않는 이유:
+        // 유효성의 근거는 이 값이 아니라 아래 IsInitialized 다. unfreeze() 는 그것을
+        // 먼저 확인하고 빠져나가므로, 여기까지 왔다면 freeze() 가 반드시 선행했다.
         size_t history_obs_len = 0;
         bool observed = false;
         // The following is to determine whether the data has been saved due to

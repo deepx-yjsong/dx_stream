@@ -150,8 +150,8 @@ size_t heap_in_use() { return mallinfo2().uordblks; }
 
 // Feed `frames` frames and return the CPU seconds spent on the window
 // [from, from + window).
-double windowed_cost(int frames, int window, int early_from, int late_from,
-                     int flicker_period, double *out_early, double *out_late) {
+void windowed_cost(int frames, int window, int early_from, int late_from,
+                   int flicker_period, double *out_early, double *out_late) {
     auto trk = TrackerFactory::createTracker(TRACKER);
     auto params = tracker_params();
     trk->init(params);
@@ -167,7 +167,6 @@ double windowed_cost(int frames, int window, int early_from, int late_from,
         if (f == late_from + window - 1)
             *out_late = cpu_seconds() - mark;
     }
-    return *out_early;
 }
 
 } // namespace
@@ -265,7 +264,11 @@ GST_START_TEST(TR_gaps_do_not_multiply_memory) {
             }
             // Measured while the tracker is alive: this is per-track retention,
             // not a leak — a dying track frees everything with its unique_ptr.
-            retained = heap_in_use() - before;
+            // Clamped rather than wrapped: these are unsigned, and a silent huge
+            // value would make the ratio meaningless while still passing the
+            // assertion below. 0 fails loudly instead.
+            size_t after = heap_in_use();
+            retained = (after > before) ? after - before : 0;
         }
         return retained;
     };
@@ -292,6 +295,15 @@ GST_START_TEST(TR_gaps_do_not_multiply_memory) {
 GST_END_TEST;
 #endif
 
+#if !DXTEST_HAVE_HEAP_PROBE
+// 건너뛴 사실은 러너가 출력을 캡처하는 시점에 알려야 한다 — suite 구성 함수에서
+// 찍으면 프레임워크에 따라 유실되거나 순서가 섞인다.
+GST_START_TEST(TR_retention_check_unavailable) {
+    g_print("[INFO] retention check skipped: needs mallinfo2 (glibc >= 2.33)\n");
+}
+GST_END_TEST;
+#endif
+
 static Suite *tracker_resource_contract_suite(void) {
     Suite *s = suite_create("tracker_resource_contract");
     TCase *tc = tcase_create("resource_contract");
@@ -302,7 +314,7 @@ static Suite *tracker_resource_contract_suite(void) {
 #if DXTEST_HAVE_HEAP_PROBE
     tcase_add_test(tc, TR_gaps_do_not_multiply_memory);
 #else
-    g_print("[INFO] retention check skipped: needs mallinfo2 (glibc >= 2.33)\n");
+    tcase_add_test(tc, TR_retention_check_unavailable);
 #endif
     return s;
 }
