@@ -373,55 +373,53 @@ private:
 // ===========================================================================
 // gst_copy_video_frame — plane-aware passthrough copy
 //
-// Used by dxscale (same-size) and dxconvert (same-format) passthrough paths.
-// Handles stride differences between HW decoder and tight-packed output.
+// Used by dxscale's same-size passthrough path (dxscale enforces the same format
+// on both pads, so src and dst always agree on format and dimensions here).
+//
+// Delegates to gst_video_frame_copy(), which is the GStreamer primitive for
+// exactly this job: it takes each plane's row length from the component width
+// times its pixel stride and the row count from the component height, so
+// subsampled formats come out right for odd dimensions too, and it honours the
+// per-plane strides and offsets that gst_video_frame_map() picks up from the
+// buffer's GstVideoMeta when a hardware decoder attached one — which is the
+// stride handling this function exists for.
+//
+// It replaces a hand-rolled plane loop that was wrong in two ways:
+//   * NV12/I420 subsampling was hard-coded and only correct for even sizes.
+//     NV12's chroma row is 2 * ceil(width/2) bytes (U and V interleave at half
+//     horizontal resolution) and its row count ceil(height/2); the loop used
+//     `width` and `height / 2`, so an odd-sized frame lost the last chroma
+//     column and row.
+//   * every other format fell through to a flat memcpy of min(size), which
+//     ignores stride entirely and therefore corrupted padded RGB/BGR — both of
+//     which dxscale accepts.
+//
+// gst_video_frame_map() also validates the buffer against the info, so a buffer
+// too small for its caps now fails here instead of being copied into a
+// half-written frame.
 // ===========================================================================
 
 inline GstFlowReturn gst_copy_video_frame(GstBuffer* inbuf, GstBuffer* outbuf,
                                            const GstVideoInfo& src_info,
                                            const GstVideoInfo& dst_info) {
-    GstMapInfo pin = GST_MAP_INFO_INIT, pout = GST_MAP_INFO_INIT;
-    if (!gst_buffer_map(inbuf, &pin, GST_MAP_READ))
+    GstVideoFrame src = {};
+    GstVideoFrame dst = {};
+    if (!gst_video_frame_map(&src, &src_info, inbuf, GST_MAP_READ))
         return GST_FLOW_ERROR;
-    if (!gst_buffer_map(outbuf, &pout, GST_MAP_WRITE)) {
-        gst_buffer_unmap(inbuf, &pin);
+    if (!gst_video_frame_map(&dst, &dst_info, outbuf, GST_MAP_WRITE)) {
+        gst_video_frame_unmap(&src);
         return GST_FLOW_ERROR;
     }
 
-    GstVideoFormat fmt = GST_VIDEO_INFO_FORMAT(&src_info);
-    int width  = GST_VIDEO_INFO_WIDTH(&src_info);
-    int height = GST_VIDEO_INFO_HEIGHT(&src_info);
+    // Fails only if format or dimensions disagree. The caller guarantees they do
+    // not, so report it rather than letting a partially written frame downstream.
+    gboolean copied = gst_video_frame_copy(&dst, &src);
 
-    if (fmt == GST_VIDEO_FORMAT_NV12 || fmt == GST_VIDEO_FORMAT_I420) {
-        GstVideoMeta* vmeta = gst_buffer_get_video_meta(inbuf);
-        int n_planes = (fmt == GST_VIDEO_FORMAT_NV12) ? 2 : 3;
+    gst_video_frame_unmap(&dst);
+    gst_video_frame_unmap(&src);
+    if (!copied)
+        return GST_FLOW_ERROR;
 
-        for (int p = 0; p < n_planes; ++p) {
-            int src_stride = vmeta ? static_cast<int>(vmeta->stride[p])
-                                   : GST_VIDEO_INFO_PLANE_STRIDE(&src_info, p);
-            size_t src_off = vmeta ? vmeta->offset[p]
-                                   : GST_VIDEO_INFO_PLANE_OFFSET(&src_info, p);
-            int dst_stride = GST_VIDEO_INFO_PLANE_STRIDE(&dst_info, p);
-            size_t dst_off = GST_VIDEO_INFO_PLANE_OFFSET(&dst_info, p);
-            int plane_h = (p == 0) ? height : height / 2;
-            int row_bytes;
-            if (fmt == GST_VIDEO_FORMAT_NV12)
-                row_bytes = (p == 0) ? width : width;
-            else
-                row_bytes = (p == 0) ? width : (width + 1) / 2;
-
-            for (int row = 0; row < plane_h; ++row) {
-                std::memcpy(pout.data + dst_off + row * dst_stride,
-                            pin.data  + src_off + row * src_stride,
-                            row_bytes);
-            }
-        }
-    } else {
-        std::memcpy(pout.data, pin.data, std::min(pin.size, pout.size));
-    }
-
-    gst_buffer_unmap(outbuf, &pout);
-    gst_buffer_unmap(inbuf, &pin);
     // Copy only timestamps and flags — GstBaseTransform handles meta copying
     gst_buffer_copy_into(outbuf, inbuf,
         static_cast<GstBufferCopyFlags>(GST_BUFFER_COPY_FLAGS | GST_BUFFER_COPY_TIMESTAMPS),
