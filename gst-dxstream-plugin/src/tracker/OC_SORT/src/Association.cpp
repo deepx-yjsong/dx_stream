@@ -190,8 +190,19 @@ associate(Eigen::MatrixXf detections, Eigen::MatrixXf trackers,
 
     Eigen::MatrixXf iou_matrix = iou_batch(detections, trackers);
 
+    // 검출 신뢰도. 업스트림은 5열 [x1,y1,x2,y2,score] 에서 `detections[:,-1]` 을 쓴다
+    // (association.py `associate`). 이 이식본의 검출 행은 element 가 결과를 원래
+    // object_meta 로 되돌려야 해서 열이 **둘** 늘어난 7열
+    // [x1,y1,x2,y2,conf,label,input_idx] 인데(gst-dxtracker.cpp), 인덱스는 `-1 → -2` 로
+    // **하나만** 밀려 있었다. 그래서 신뢰도가 아니라 **라벨**을 읽었고,
+    // `angle_diff_cost = valid_mask * diff_angle * vdc_weight * scores` 이므로
+    // **label == 0(우리 운영의 person)이면 항 전체가 0** 이 되어 OC-SORT 의
+    // 관측 중심 방향 일치(OCM)가 통째로 꺼져 있었다. 최초 릴리스 커밋부터 그랬다.
+    //
+    // 이 파일 밖의 모든 접근은 절대 인덱스다(OCSort.cpp: col(4)=conf, (_,5)=cls,
+    // (_,6)=input_idx). 여기만 상대 인덱스라 열이 늘 때 조용히 어긋났다 — 맞춰 둔다.
     Eigen::MatrixXf scores =
-        detections.col(detections.cols() - 2).replicate(1, trackers.rows());
+        detections.col(4).replicate(1, trackers.rows());
 
     Eigen::Matrix<bool, Eigen::Dynamic, Eigen::Dynamic> valid_mask_ =
         valid_mask.transpose().replicate(1, X.cols());
