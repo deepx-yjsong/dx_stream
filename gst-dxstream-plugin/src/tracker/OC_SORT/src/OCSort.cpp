@@ -1,4 +1,6 @@
-﻿#include "../include/OCSort.hpp"
+﻿#include <string>
+#include <stdexcept>
+#include "../include/OCSort.hpp"
 #include "../include/lapjv.hpp"
 #include "../../common/include/TrackerFactory.hpp"
 #include "iomanip"
@@ -18,6 +20,29 @@ std::ostream &operator<<(std::ostream &os, const std::vector<Matrix> &v) {
     return os;
 }
 
+namespace {
+/** 실패해도 던지지 않는 정수 파싱. 실패 시 기본값. */
+int parse_int_or(const std::string &s, int dflt) {
+    try {
+        size_t pos = 0;
+        const int v = std::stoi(s, &pos);
+        return pos == 0 ? dflt : v;
+    } catch (const std::exception &) {
+        return dflt;
+    }
+}
+/** 실패해도 던지지 않는 실수 파싱. 실패 시 기본값. */
+float parse_float_or(const std::string &s, float dflt) {
+    try {
+        size_t pos = 0;
+        const float v = std::stof(s, &pos);
+        return pos == 0 ? dflt : v;
+    } catch (const std::exception &) {
+        return dflt;
+    }
+}
+} // namespace
+
 void OCSort::init(const std::map<std::string, std::string, std::less<>> &params) {
 
     // Helper lambda function to retrieve value or use default
@@ -27,13 +52,26 @@ void OCSort::init(const std::map<std::string, std::string, std::less<>> &params)
         return (it != params.end()) ? it->second : default_value;
     };
 
-    max_age = std::stoi(get_param("max_age", "30"));
-    min_hits = std::stoi(get_param("min_hits", "3"));
-    iou_threshold = std::stof(get_param("iou_threshold", "0.3"));
+    // 파싱은 **절대 던지지 않는다.** 예전에는 `std::stoi`/`std::stof` 를 그대로 불렀는데,
+    // `init()` 은 `gst-dxtracker.cpp` 의 chain 함수에서 **try/catch 없이** 호출된다.
+    // 그래서 `tracker_config.json` 에 `"max_age": "abc"` 나 빈 문자열이 하나만 있어도
+    // 예외가 C 코드를 거슬러 올라가 **프로세스가 그대로 죽었다**(실측: SIGABRT, core dumped).
+    // 설정 오타 하나로 엣지 데몬이 내려가는 것은 어떤 기본값보다 나쁘다 — 실패하면
+    // 문서화된 기본값을 쓴다.
+    max_age = parse_int_or(get_param("max_age", "30"), 30);
+    min_hits = parse_int_or(get_param("min_hits", "3"), 3);
+    iou_threshold = parse_float_or(get_param("iou_threshold", "0.3"), 0.3f);
     trackers.clear();
     frame_count = 0;
-    det_thresh = std::stof(get_param("det_thresh", "0.5"));
-    delta_t = std::stoi(get_param("delta_t", "3"));
+    det_thresh = parse_float_or(get_param("det_thresh", "0.5"), 0.5f);
+    delta_t = parse_int_or(get_param("delta_t", "3"), 3);
+
+    // 음수 `delta_t` 는 0 으로 정규화한다. 업스트림 파이썬은 `range(delta_t)` 이므로
+    // 0 이하가 모두 "되돌아보지 않음" 으로 같은 뜻이 된다 — 의미를 바꾸지 않으면서
+    // C++ 쪽에서 음수가 인덱스 계산에 새어 들어가는 것만 막는다
+    // (`KalmanBoxTracker::update` 의 잘라내기 상한이 이 값으로 정해진다).
+    if (delta_t < 0)
+        delta_t = 0;
 
     std::string asso_func_key = get_param("asso_func", "iou");
     asso_func = (asso_func_key == "giou") ? giou_batch : iou_batch;
