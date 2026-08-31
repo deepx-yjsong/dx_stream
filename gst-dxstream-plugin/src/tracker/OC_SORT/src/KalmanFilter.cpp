@@ -28,8 +28,24 @@ void KalmanFilterNew::predict() {
     x_prior = x;
     P_prior = P;
 }
+// 이력에서 항상 유지하는 최소 개수. 해동이 필요로 하는 것은 마지막 non-null 두 건뿐이고
+// 해동 직후 남는 개수가 이 값보다 1 작아지므로 2 이상이면 충분하다 — 여유를 둔다.
+static constexpr std::size_t kHistoryKeep = 8;
+
 void KalmanFilterNew::update(const Eigen::VectorXf &z_) {
     history_obs.push_back(z_);
+    ++total_pushes;
+
+    // 동결이 걸려 있지 않을 때만 앞을 잘라낸다.
+    //
+    // 동결~해동 사이에는 자르지 않는다: 그 구간의 항목이 곧 해동이 읽을 대상이다.
+    // 그 구간의 길이는 무한하지 않다 — 트래커는 `time_since_update > max_age` 에서
+    // 삭제되므로(OCSort.cpp) 공백은 `max_age` 로 묶인다. 즉 이 벡터의 최대 크기는
+    // `kHistoryKeep + max_age + 2` 이고, **트랙 수명과 무관한 상수**가 된다.
+    if (!attr_saved.IsInitialized && history_obs.size() > kHistoryKeep) {
+        history_obs.erase(history_obs.begin(),
+                          history_obs.end() - static_cast<std::ptrdiff_t>(kHistoryKeep));
+    }
     if (z_.size() == 0) {
         if (true == observed)
             freeze();
@@ -74,7 +90,7 @@ void KalmanFilterNew::freeze() {
     attr_saved.P_prior = P_prior;
     attr_saved.x_post = x_post;
     attr_saved.P_post = P_post;
-    attr_saved.history_obs_len = history_obs.size();
+    attr_saved.pushes_at_freeze = total_pushes;
 }
 void KalmanFilterNew::unfreeze() {
     if (!attr_saved.IsInitialized) {
@@ -125,16 +141,20 @@ void KalmanFilterNew::unfreeze() {
 
     // 이력을 동결 시점 스냅샷에서 마지막 한 건을 뺀 상태로 되감는다(업스트림 :424 + :426).
     // 공백 구간에 쌓인 비관측 항목이 여기서 버려지므로 이력이 공백마다 늘어나지 않는다.
-    // 스냅샷이 접두이므로(위 history_obs_len 주석의 불변식) resize 가 곧 되감기다 —
+    // 스냅샷이 접두이므로(헤더 pushes_at_freeze 주석의 불변식) 되감기에 복사가 없다 —
     // 복사도, 보관도 없다. 이식은 되감기 없이 현재 이력에서 한 건만 빼고 스냅샷을 영구
     // 보관해, 트랙 하나가 전량 이력을 셋(현재 + new_history + 스냅샷) 들고 있었다.
-    // history_obs_len = 0 은 업스트림의 attr_saved = None(:425) 에 해당한다.
-    if (attr_saved.history_obs_len > 0) {
-        history_obs.resize(attr_saved.history_obs_len - 1);
+    // pushes_at_freeze = 0 은 업스트림의 attr_saved = None(:425) 에 해당한다.
+    // 되감기를 **상대 개수**로 계산한다. 동결 뒤 붙은 것(공백 구간의 비관측 항목들과
+    // 방금 붙은 관측)을 전부 떼고, 업스트림의 `[:-1]` 에 해당하는 한 건을 더 뗀다.
+    // 절대 길이를 쓰면 앞을 잘라낸 뒤에는 다른 지점을 가리킨다.
+    const std::size_t appended = total_pushes - attr_saved.pushes_at_freeze;
+    if (history_obs.size() > appended + 1) {
+        history_obs.resize(history_obs.size() - appended - 1);
     } else {
         history_obs.clear();
     }
-    attr_saved.history_obs_len = 0;
+    attr_saved.pushes_at_freeze = 0;
     attr_saved.IsInitialized = false;
 
     if (lastNotNullIndex == -1 || secondLastNotNullIndex == -1) {

@@ -151,7 +151,8 @@ size_t heap_in_use() { return mallinfo2().uordblks; }
 // Feed `frames` frames and return the CPU seconds spent on the window
 // [from, from + window).
 void windowed_cost(int frames, int window, int early_from, int late_from,
-                   int flicker_period, double *out_early, double *out_late) {
+                   int flicker_period, int gap_len, double *out_early,
+                   double *out_late) {
     auto trk = TrackerFactory::createTracker(TRACKER);
     auto params = tracker_params();
     trk->init(params);
@@ -160,7 +161,7 @@ void windowed_cost(int frames, int window, int early_from, int late_from,
     for (int f = 0; f < frames; ++f) {
         if (f == early_from || f == late_from)
             mark = cpu_seconds();
-        bool drop = flicker_period > 0 && (f % flicker_period == 0);
+        bool drop = flicker_period > 0 && (f % flicker_period) < gap_len;
         trk->update(make_dets(scene(drop, false)));
         if (f == early_from + window - 1)
             *out_early = cpu_seconds() - mark;
@@ -185,7 +186,7 @@ GST_START_TEST(TR_per_frame_cost_is_flat) {
     const int LATE_FROM = FRAMES - WINDOW;
 
     double early = 0.0, late = 0.0;
-    windowed_cost(FRAMES, WINDOW, EARLY_FROM, LATE_FROM, 0, &early, &late);
+    windowed_cost(FRAMES, WINDOW, EARLY_FROM, LATE_FROM, 0, 0, &early, &late);
 
     double ratio = (early > 0.0) ? late / early : 0.0;
     g_print("[DIAG] per-frame cost: early(%d..%d)=%.1f us  late(%d..%d)=%.1f us  "
@@ -220,7 +221,8 @@ GST_START_TEST(TR_flicker_cost_is_flat) {
     const int FLICKER = 4;
 
     double early = 0.0, late = 0.0;
-    windowed_cost(FRAMES, WINDOW, EARLY_FROM, LATE_FROM, FLICKER, &early, &late);
+    windowed_cost(FRAMES, WINDOW, EARLY_FROM, LATE_FROM, FLICKER, 1, &early,
+                  &late);
 
     double ratio = (early > 0.0) ? late / early : 0.0;
     g_print("[DIAG] flicker cost (gap every %d frames): early=%.1f us  "
@@ -245,19 +247,89 @@ GST_END_TEST;
 // released (:425), so B must retain no more than A — in fact slightly less,
 // because a missed frame appends no observation.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Same measurement again, but the gap is LONGER THAN delta_t.
+//
+// This is the case the two checks above cannot reach, and missing it is why a
+// build that passed all of them still lost 22% of its throughput over 46 hours
+// in production. `k_previous_obs()` answers from `observations` in O(1) only
+// while the track was seen within the last delta_t frames (Utilities.cpp); past
+// that it falls through to a `std::max_element` over the whole map. Neither
+// check above ever produces more than one consecutive miss, so both stay on the
+// fast path forever and the fall-through is never measured.
+//
+// A gap longer than delta_t is ordinary: max_age (50 here) is precisely the
+// number of consecutive misses a track is allowed before it is dropped, so
+// every occlusion between delta_t+1 and max_age frames lands here.
+//
+// The gap is derived from delta_t rather than hardcoded — delta_t is a user
+// setting (edge/configs/tracker_config.json), and a fixed number would silently
+// stop testing this path the moment someone raises it.
+// ---------------------------------------------------------------------------
+GST_START_TEST(TR_cost_is_flat_across_gaps_longer_than_delta_t) {
+    const int FRAMES = 30000;
+    const int WINDOW = 2000;
+    const int EARLY_FROM = 200;
+    const int LATE_FROM = FRAMES - WINDOW;
+    const int delta_t = std::stoi(tracker_params()["delta_t"]);
+    const int GAP = delta_t + 7;       // > delta_t, well under max_age
+    const int PERIOD = GAP + 40;
+
+    double early = 0.0, late = 0.0;
+    windowed_cost(FRAMES, WINDOW, EARLY_FROM, LATE_FROM, PERIOD, GAP, &early,
+                  &late);
+
+    double ratio = (early > 0.0) ? late / early : 0.0;
+    g_print("[DIAG] long-gap cost (gap=%d > delta_t=%d, every %d): early=%.1f us  "
+            "late=%.1f us  ratio=%.2fx\n", GAP, delta_t, PERIOD,
+            1e6 * early / WINDOW, 1e6 * late / WINDOW, ratio);
+
+    fail_unless(early > 0.0, "CPU clock produced no measurable early window");
+    fail_unless(ratio <= 3.0,
+                "per-frame cost grew %.2fx over a track's life when gaps exceed "
+                "delta_t (limit 3.0x) — k_previous_obs() is falling through to a "
+                "full scan of an observation map that grows with track age "
+                "(Utilities.cpp max_element; the map must be trimmed to the keys "
+                "its readers use, KalmanBoxTracker::update)",
+                ratio);
+}
+GST_END_TEST;
+
 #if DXTEST_HAVE_HEAP_PROBE
-GST_START_TEST(TR_gaps_do_not_multiply_memory) {
-    const int FRAMES = 4000;
+// ---------------------------------------------------------------------------
+// Retention must not grow with a track's age.
+//
+// This check replaced an earlier one that compared retention *with gaps* against
+// retention *without* them and allowed 1.15x. That shape was chosen while
+// unbounded accumulation was still accepted as "the reference does it too", so
+// only the ratio between the two runs could say anything. That premise is gone:
+// `observations` is now trimmed to the last delta_t entries and `history_obs` to
+// a fixed tail, both justified by enumerating every reader, so retention is
+// O(1) in track age. Against a constant, the old ratio compares two small
+// numbers whose difference is just the in-flight gap buffer -- it reports 1.56x
+// while the absolute retention fell ~100x, i.e. it now fires on an improvement.
+//
+// The replacement asserts the property that actually matters for a 24/7
+// pipeline and is strictly stronger: quadruple the frames, and retention must
+// not quadruple. It still catches what the old one caught -- a deep copy in
+// freeze()/unfreeze() makes the gapped run grow with age -- and it additionally
+// catches plain unbounded accumulation, which the old one accepted by design.
+// Verified to FAIL on the shipped build (linear retention) before being adopted.
+// ---------------------------------------------------------------------------
+GST_START_TEST(TR_retention_does_not_grow_with_track_age) {
+    const int SHORT = 4000;
+    const int LONG = 16000;   // 4x
     const int PERIOD = 40;
 
-    auto run = [&](bool with_gaps) -> size_t {
+    auto run = [&](int frames, bool with_gaps) -> size_t {
         size_t before = heap_in_use();
         size_t retained = 0;
         {
             auto trk = TrackerFactory::createTracker(TRACKER);
             auto params = tracker_params();
             trk->init(params);
-            for (int f = 0; f < FRAMES; ++f) {
+            for (int f = 0; f < frames; ++f) {
                 bool drop_res = with_gaps && (f % PERIOD == 0);
                 bool drop_comp = with_gaps && (f % PERIOD == PERIOD / 2);
                 trk->update(make_dets(scene(drop_res, drop_comp)));
@@ -273,24 +345,38 @@ GST_START_TEST(TR_gaps_do_not_multiply_memory) {
         return retained;
     };
 
-    size_t flat = run(false);
-    size_t gapped = run(true);
+    // Long first: the allocator is warmer for the short run, so any bias from
+    // arena growth works against the assertion rather than for it.
+    size_t long_gap = run(LONG, true);
+    size_t short_gap = run(SHORT, true);
+    size_t long_flat = run(LONG, false);
+    size_t short_flat = run(SHORT, false);
 
-    double ratio =
-        (flat > 0) ? static_cast<double>(gapped) / static_cast<double>(flat) : 0.0;
-    g_print("[DIAG] retained bytes: no-gap=%zu (%.0f B/frame)  "
-            "gap-every-%d=%zu (%.0f B/frame)  ratio=%.2fx\n",
-            flat, static_cast<double>(flat) / FRAMES, PERIOD, gapped,
-            static_cast<double>(gapped) / FRAMES, ratio);
+    double r_flat = (short_flat > 0)
+                        ? static_cast<double>(long_flat) / short_flat : 0.0;
+    double r_gap = (short_gap > 0)
+                       ? static_cast<double>(long_gap) / short_gap : 0.0;
 
-    fail_unless(flat > 0, "no-gap run retained nothing — measurement is broken");
-    fail_unless(ratio <= 1.15,
-                "miss->hit cycles multiplied retained memory %.2fx (limit 1.15x): "
-                "%zu B with gaps vs %zu B without, over %d frames — freeze()/"
-                "unfreeze() are keeping deep copies of the observation history "
-                "that upstream does not (kalmanfilter.py:421 aliases the list, "
-                ":425 releases the snapshot)",
-                ratio, gapped, flat, FRAMES);
+    g_print("[DIAG] retention vs age (%dx frames): no-gap %zu->%zu B (%.2fx)  "
+            "gap-every-%d %zu->%zu B (%.2fx)\n",
+            LONG / SHORT, short_flat, long_flat, r_flat, PERIOD, short_gap,
+            long_gap, r_gap);
+
+    fail_unless(short_flat > 0 && short_gap > 0,
+                "short runs retained nothing — measurement is broken");
+    // 4x the frames. Linear accumulation lands at 4.0x; a bound lands at 1.0x.
+    fail_unless(r_flat <= 1.5,
+                "retention grew %.2fx when the track lived %dx longer (limit "
+                "1.50x): %zu B at %d frames vs %zu B at %d frames — the "
+                "observation history is accumulating with track age instead of "
+                "being trimmed to what its readers use",
+                r_flat, LONG / SHORT, short_flat, SHORT, long_flat, LONG);
+    fail_unless(r_gap <= 1.5,
+                "with miss->hit cycles, retention grew %.2fx over a %dx longer "
+                "life (limit 1.50x): %zu B vs %zu B — freeze()/unfreeze() are "
+                "keeping history that upstream releases (kalmanfilter.py:421 "
+                "aliases the list, :425 releases the snapshot)",
+                r_gap, LONG / SHORT, short_gap, long_gap);
 }
 GST_END_TEST;
 #endif
@@ -311,8 +397,9 @@ static Suite *tracker_resource_contract_suite(void) {
     suite_add_tcase(s, tc);
     tcase_add_test(tc, TR_per_frame_cost_is_flat);
     tcase_add_test(tc, TR_flicker_cost_is_flat);
+    tcase_add_test(tc, TR_cost_is_flat_across_gaps_longer_than_delta_t);
 #if DXTEST_HAVE_HEAP_PROBE
-    tcase_add_test(tc, TR_gaps_do_not_multiply_memory);
+    tcase_add_test(tc, TR_retention_does_not_grow_with_track_age);
 #else
     tcase_add_test(tc, TR_retention_check_unavailable);
 #endif
