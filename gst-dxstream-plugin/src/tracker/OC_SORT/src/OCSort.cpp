@@ -392,9 +392,11 @@ std::vector<Eigen::RowVectorXf> OCSort::GenerateOutputAndCleanup() {
              (this->frame_count <= this->min_hits))) {
 
             Eigen::Matrix<float, 1, 4> d_bbox_coords;
+            // 업스트림은 `trk.last_observation.sum() < 0` 로 판정한다 (ocsort.py).
+            // 첫 성분만 보면 초기 표식 이외의 조합에서 갈릴 수 있으므로 합으로 맞춘다.
             bool has_valid_last_obs =
                 (tracker->get_last_observation().size() >= 4 &&
-                 tracker->get_last_observation()(0) >= 0.0f);
+                 tracker->get_last_observation().sum() >= 0.0f);
 
             if (!has_valid_last_obs) {
                 d_bbox_coords = tracker->get_state();
