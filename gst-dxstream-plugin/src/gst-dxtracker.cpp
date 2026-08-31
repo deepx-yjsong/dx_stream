@@ -305,7 +305,18 @@ void track(GstDxTracker *self, DXFrameMeta *frame_meta) {
                 ("Unknown tracker algorithm: %s", self->_tracker_name), (NULL));
             return;
         }
-        tracker->init(self->_params);
+        // 알고리즘 계층에서 던지는 것이 여기까지 오면 안 된다 — 여기는 GStreamer
+        // chain 함수이고, 예외가 C 프레임을 거슬러 올라가면 프로세스가 그대로 죽는다.
+        // 파싱은 이제 던지지 않지만(OCSort::init), 다른 트래커 구현이나 앞으로의
+        // 변경까지 막아 두는 그물이다. 조용히 삼키지 않고 element 오류로 올린다.
+        try {
+            tracker->init(self->_params);
+        } catch (const std::exception &e) {
+            GST_ELEMENT_ERROR(self, LIBRARY, INIT,
+                ("Tracker '%s' failed to initialise: %s",
+                 self->_tracker_name, e.what()), (NULL));
+            return;
+        }
         self->_trackers[frame_meta->_stream_id] = std::move(tracker);
     }
 
