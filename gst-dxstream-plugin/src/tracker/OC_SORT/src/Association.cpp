@@ -104,16 +104,22 @@ Eigen::MatrixXf giou_batch(const Eigen::MatrixXf &bboxes1,
 
     Eigen::MatrixXf wc = xxc2 - xxc1;
     Eigen::MatrixXf hc = yyc2 - yyc1;
-    if ((wc.array() > 0).all() && (hc.array() > 0).all())
+
+    // 업스트림의 `assert((wc > 0).all() and (hc > 0).all())` 자리다 (association.py).
+    // **사전조건 확인이지 분기가 아니다** — 이식본은 이것을 뒤집힌 if 로 옮겨,
+    // 조건이 참인 정상 경로에서 GIoU 대신 **평범한 IoU 를 돌려주고** 있었다.
+    // 유효한 상자라면 xxc2 > xxc1 이므로 조건은 사실상 항상 참이고, 결과적으로
+    // 이 함수는 이름과 달리 IoU 함수였다. 퇴화 상자에서는 0 나눗셈이 되므로
+    // 죽는 대신 IoU 로 물러난다 — GStreamer 파이프라인에서 abort 는 선택지가 아니다.
+    if (!((wc.array() > 0).all() && (hc.array() > 0).all()))
         return iou;
-    else {
-        Eigen::MatrixXf area_enclose = wc.array() * hc.array();
-        Eigen::MatrixXf giou =
-            iou.array() -
-            (area_enclose.array() - wh.array()) / area_enclose.array();
-        giou = (giou.array() + 1) / 2.0;
-        return giou;
-    }
+
+    Eigen::MatrixXf area_enclose = wc.array() * hc.array();
+    // 빼는 것은 **합집합**(위 `Sum`)이다. 이식본은 교집합(`wh`)을 빼고 있었다.
+    Eigen::MatrixXf giou =
+        iou.array() - (area_enclose.array() - Sum.array()) / area_enclose.array();
+    giou = (giou.array() + 1) / 2.0;
+    return giou;
 }
 
 void collectSimpleMatches(

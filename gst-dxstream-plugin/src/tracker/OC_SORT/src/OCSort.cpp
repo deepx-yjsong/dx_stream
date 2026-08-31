@@ -254,8 +254,10 @@ void OCSort::PerformByteAssociation(
     if (u_trks_predictions.rows() == 0)
         return;
 
+    // 업스트림은 여기서 `self.asso_func` 를 쓴다(ocsort.py). 이식본은 giou_batch 를
+    // 하드코딩해 `asso_func` 설정이 죽어 있었다 — 대입만 되고 호출되는 곳이 없었다.
     Eigen::MatrixXf iou_values =
-        giou_batch(low_conf_dets.leftCols(4), u_trks_predictions.leftCols(4));
+        this->asso_func(low_conf_dets.leftCols(4), u_trks_predictions.leftCols(4));
     if (iou_values.rows() == 0 || iou_values.cols() == 0 ||
         iou_values.maxCoeff() <= this->iou_threshold)
         return;
@@ -306,9 +308,10 @@ void OCSort::PerformIOUReAssociation(
         current_unmatched_trks_last_boxes_subset.rows() == 0)
         return;
 
+    // 업스트림과 같이 `asso_func` 를 쓴다(위 PerformByteAssociation 주석 참고).
     Eigen::MatrixXf iou_values =
-        giou_batch(current_unmatched_dets_subset.leftCols(4),
-                   current_unmatched_trks_last_boxes_subset.leftCols(4));
+        this->asso_func(current_unmatched_dets_subset.leftCols(4),
+                        current_unmatched_trks_last_boxes_subset.leftCols(4));
     if (iou_values.rows() == 0 || iou_values.cols() == 0 ||
         iou_values.maxCoeff() <= this->iou_threshold)
         return;
