@@ -138,6 +138,33 @@ void OCSort::PrepareTrackDataForAssociation(
     Eigen::MatrixXf &out_predicted_bbox_states, Eigen::MatrixXf &out_velocities,
     Eigen::MatrixXf &out_last_observed_bboxes,
     Eigen::MatrixXf &out_k_previous_observations_matrix) {
+    // 업스트림 순서를 지킨다: **① 전부 예측 → ② NaN 트랙 제거 → ③ 나머지로 행렬 구성**
+    // (ocsort.py: `if np.any(np.isnan(pos)): to_del.append(t)` 뒤에
+    //  `for t in reversed(to_del): self.trackers.pop(t)`).
+    //
+    // NaN 은 도달 가능하다. `convert_x_to_bbox` 는 `w = sqrt(x(2)*x(3))`, `h = x(2)/w` 인데
+    // 상태의 s(면적)·r(비율)에 부호 제약이 없어, 관측 없이 오래 표류하면 s 가 음수로 흐를 수
+    // 있다. `predict()` 의 가드는 `x(6)+x(2) <= 0` 일 때 s 의 속도만 0 으로 만들고 s 자체를
+    // 막지 못한다. NaN 이 나오면 IoU 비교와 헝가리안 비용까지 전파되고, 이식본은 그 트랙을
+    // 지우지 않아 max_age 까지 남는다 — 그동안 연관 판정 전체가 오염된다.
+    std::vector<size_t> nan_indices;
+    std::vector<Eigen::RowVectorXf> positions;
+    positions.reserve(this->trackers.size());
+    for (size_t i = 0; i < this->trackers.size(); ++i) {
+        Eigen::RowVectorXf pos = this->trackers[i]->predict();
+        if (!pos.allFinite())
+            nan_indices.push_back(i);
+        positions.push_back(std::move(pos));
+    }
+    if (!nan_indices.empty()) {
+        for (auto it = nan_indices.rbegin(); it != nan_indices.rend(); ++it) {
+            this->trackers.erase(this->trackers.begin() +
+                                 static_cast<std::ptrdiff_t>(*it));
+            positions.erase(positions.begin() +
+                            static_cast<std::ptrdiff_t>(*it));
+        }
+    }
+
     size_t num_trackers = this->trackers.size();
     out_predicted_bbox_states.resize(num_trackers, 5);
     out_velocities.resize(num_trackers, 2);
@@ -145,7 +172,7 @@ void OCSort::PrepareTrackDataForAssociation(
     out_k_previous_observations_matrix.resize(num_trackers, 5);
 
     for (size_t i = 0; i < num_trackers; ++i) {
-        Eigen::RowVectorXf pos = this->trackers[i]->predict();
+        const Eigen::RowVectorXf &pos = positions[i];
         out_predicted_bbox_states.row(i) << pos(0), pos(1), pos(2), pos(3), 0;
         out_velocities.row(i) = this->trackers[i]->get_velocity();
         out_last_observed_bboxes.row(i) = this->trackers[i]->get_last_observation();
