@@ -1,4 +1,5 @@
-﻿#include "../include/KalmanBoxTracker.hpp"
+﻿#include <algorithm>
+#include "../include/KalmanBoxTracker.hpp"
 #include <utility>
 namespace ocsort {
 KalmanBoxTracker::KalmanBoxTracker(Eigen::VectorXf bbox_, int cls_, int idx_,
@@ -69,6 +70,24 @@ void KalmanBoxTracker::update(Eigen::VectorXf *bbox_, int cls_, int idx_) {
 
     last_observation = *bbox_;
     observations[age] = *bbox_;
+
+    // 다시 읽히지 않을 관측을 버린다.
+    //
+    // `observations` 를 읽는 곳은 코드 전체에서 셋뿐이고, 전부 **최근 delta_t 개**만 본다:
+    //   ① 바로 위 이 함수의 `observations[age - dt]`  (dt = 1..delta_t)
+    //   ② `k_previous_obs()` 의 `observations_.at(cur_age - dt)` (dt = 1..delta_t)
+    //   ③ `k_previous_obs()` 의 폴백 `max_element` — 방금 넣은 이 항목이 최대 키다
+    // `age` 는 단조 증가하므로 `age - delta_t` 보다 오래된 키는 **영원히 안 읽힌다.**
+    // 업스트림(noahcao/OC_SORT)은 이것을 지우지 않는데, 30~60초짜리 MOT 클립에서는
+    // 무해하기 때문이다. 24/7 파이프라인에서는 트랙 하나가 프레임마다 한 건씩 영원히
+    // 쌓아 올린다 — 10fps 로 하루면 86만 건이다.
+    //
+    // 보존 개수는 **delta_t 로 정해진다** — 상수로 박으면 설정을 바꾼 순간 조용히 틀린다.
+    // 음수 delta_t 는 설정 파일에서 막히지 않으므로(OCSort.cpp 의 stoi) 여기서 0으로 막는다;
+    // 그러지 않으면 방금 넣은 항목까지 지워 폴백이 빈 맵을 훑게 된다.
+    const int keep_from = age - std::max(0, delta_t);
+    for (; oldest_obs_age < keep_from; ++oldest_obs_age)
+        observations.erase(oldest_obs_age);
     time_since_update = 0;
     history.clear();
     hits += 1;

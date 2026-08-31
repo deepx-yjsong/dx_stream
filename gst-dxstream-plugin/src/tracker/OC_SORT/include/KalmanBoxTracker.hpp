@@ -48,6 +48,8 @@ class KalmanBoxTracker {
     int cls;
     int idx;
     Eigen::RowVectorXf last_observation = Eigen::RowVectorXf::Zero(5);
+    // 아직 지우지 않은 가장 오래된 관측 키. 잘라내기를 O(지운 개수)로 만든다.
+    int oldest_obs_age = 0;
     std::unordered_map<int, Eigen::VectorXf> observations;
     // The reference implementation keeps a `history_observations` list alongside
     // `observations`; it is deliberately not ported. Its only consumer there is

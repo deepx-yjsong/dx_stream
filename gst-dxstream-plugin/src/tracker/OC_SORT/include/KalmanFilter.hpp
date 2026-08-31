@@ -77,8 +77,18 @@ class KalmanFilterNew {
     // there will always be a copy of x,P after update() is called
     Eigen::VectorXf x_post;
     Eigen::MatrixXf P_post;
-    // keeps all observations. When there is a 'z', it is directly pushed back.
+    // 관측 이력. `update()` 마다 한 건씩 붙는다(비관측이면 빈 벡터).
+    //
+    // **끝의 일부만 유지한다.** 업스트림(noahcao/OC_SORT)은 이것을 영원히 쌓는데,
+    // 30~60초짜리 MOT 클립에서는 무해하다. 24/7 파이프라인에서는 죽지 않는 트랙 하나가
+    // 프레임마다 한 건씩 무한히 쌓아 올린다. 이 벡터를 **내용으로 읽는 곳은
+    // `unfreeze()` 하나뿐이고, 거기서 필요한 것은 마지막 non-null 두 건과 그 사이
+    // 인덱스 차이(`time_gap`)** 뿐이다 — 둘 다 끝에 있고, 차이는 앞을 잘라도 보존된다.
     std::vector<Eigen::VectorXf> history_obs;
+    // `history_obs` 에 지금까지 밀어 넣은 총 개수. **줄지 않는다.**
+    // 동결/해동 부기를 벡터의 절대 길이가 아니라 이 값의 차이로 표현하기 위한 것이다 —
+    // 절대 길이를 쓰면 앞을 잘라내는 순간 조용히 틀린다.
+    std::size_t total_pushes = 0;
     // The following is newly added by ocsort.
     // Used to mark the tracking state (whether there is still a target matching
     // this trajectory), default value is false.
@@ -103,14 +113,18 @@ class KalmanFilterNew {
         Eigen::MatrixXf P_prior;
         Eigen::VectorXf x_post;
         Eigen::MatrixXf P_post;
-        // 동결 시점의 이력 길이. 업스트림은 여기서 리스트를 얕게 복사하지만
+        // 동결 시점까지의 **누적 밀어넣기 횟수**. 업스트림은 여기서 리스트를 얕게 복사하지만
         // (list(self.history_obs), kalmanfilter.py:407 — 원소는 공유되고 포인터만 복사)
         // C++ 로 그대로 옮기면 Eigen 벡터 n개를 깊은 복사하게 되고, 깜빡이는 트랙에서는
         // 공백마다 그 비용을 다시 낸다(측정: 깜빡임 주기 4프레임에서 프레임당 비용이
         // 트랙 수명에 따라 3.18배 증가). 동결과 해동 사이 history_obs 는 추가만 되므로
         // (KalmanFilterNew::update 의 push_back 이 유일한 변경) 스냅샷은 접두
-        // history_obs[0, history_obs_len) 과 정확히 같다 — 길이만 기억하면 복사가 없다.
-        size_t history_obs_len = 0;
+        // 접두와 정확히 같다 — 개수만 기억하면 복사가 없다.
+        //
+        // 벡터의 **절대 길이**가 아니라 `total_pushes` 를 기억하는 이유: 이력은 이제 앞이
+        // 잘려 나가므로 절대 길이가 시점마다 다른 것을 가리킨다. 해동은 "동결 뒤 몇 건이
+        // 붙었나"라는 **차이**만 알면 되고, 그 차이는 잘라내기에 영향받지 않는다.
+        std::size_t pushes_at_freeze = 0;
         bool observed = false;
         // The following is to determine whether the data has been saved due to
         // freezing.
