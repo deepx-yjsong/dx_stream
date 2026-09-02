@@ -76,7 +76,7 @@ void OCSort::init(const std::map<std::string, std::string, std::less<>> &params)
     std::string asso_func_key = get_param("asso_func", "iou");
     asso_func = (asso_func_key == "giou") ? giou_batch : iou_batch;
 
-    inertia = std::stof(get_param("inertia", "0.2"));
+    inertia = parse_float_or(get_param("inertia", "0.2"), 0.2f);
     use_byte = (get_param("use_byte", "false") == "true");
     id_count = 0;
 }
