@@ -28,20 +28,22 @@ void KalmanFilterNew::predict() {
     x_prior = x;
     P_prior = P;
 }
-// 이력에서 항상 유지하는 최소 개수. 해동이 필요로 하는 것은 마지막 non-null 두 건뿐이고
-// 해동 직후 남는 개수가 이 값보다 1 작아지므로 2 이상이면 충분하다 — 여유를 둔다.
+// Minimum number of history entries always kept. unfreeze() only needs the last
+// two non-null observations, and one fewer remains right after it runs, so 2
+// would do; this leaves room.
 static constexpr std::size_t kHistoryKeep = 8;
 
 void KalmanFilterNew::update(const Eigen::VectorXf &z_) {
     history_obs.push_back(z_);
     ++total_pushes;
 
-    // 동결이 걸려 있지 않을 때만 앞을 잘라낸다.
+    // Only trim while no freeze is in effect.
     //
-    // 동결~해동 사이에는 자르지 않는다: 그 구간의 항목이 곧 해동이 읽을 대상이다.
-    // 그 구간의 길이는 무한하지 않다 — 트래커는 `time_since_update > max_age` 에서
-    // 삭제되므로(OCSort.cpp) 공백은 `max_age` 로 묶인다. 즉 이 벡터의 최대 크기는
-    // `kHistoryKeep + max_age + 2` 이고, **트랙 수명과 무관한 상수**가 된다.
+    // Between freeze and unfreeze the entries are exactly what unfreeze() will
+    // read, so they stay. That window is bounded: OCSort drops a tracker once
+    // `time_since_update > max_age`, so a gap cannot exceed max_age. The vector
+    // is therefore at most `kHistoryKeep + max_age + 2` entries — a constant,
+    // independent of how long the track lives.
     if (!attr_saved.IsInitialized && history_obs.size() > kHistoryKeep) {
         history_obs.erase(history_obs.begin(),
                           history_obs.end() - static_cast<std::ptrdiff_t>(kHistoryKeep));
@@ -97,11 +99,13 @@ void KalmanFilterNew::unfreeze() {
         return;
     }
 
-    // 가상 궤적 생성에 필요한 것은 "가장 최근 실관측 두 건과 그 사이 프레임 수" 뿐이다.
-    // 업스트림은 이 값을 리스트 별칭(new_history = self.history_obs,
-    // noahcao/OC_SORT kalmanfilter.py:421)으로 읽고, 호출이 끝나면 별칭이 사라진다 —
-    // 복사가 아니다. 이식은 이것을 멤버에 대한 전량 깊은 복사로 바꿔 트랙 수명 내내
-    // 이력 사본을 하나 더 들고 있었다. 되감기 전에 제자리에서 읽으면 내용은 같고 복사는 없다.
+    // Building the virtual trajectory needs only the two most recent real
+    // observations and the number of frames between them. Upstream reads them
+    // through a list alias (new_history = self.history_obs,
+    // kalmanfilter.py:421) that disappears when the call returns — no copy. The
+    // port made it a full deep copy into a member, so every track carried a
+    // second history for its whole life. Reading in place before the rewind
+    // gives the same values with no copy.
     int lastNotNullIndex = -1;
     int secondLastNotNullIndex = -1;
     Eigen::VectorXf box1;
@@ -139,15 +143,19 @@ void KalmanFilterNew::unfreeze() {
     P_prior = attr_saved.P_prior;
     x_post = attr_saved.x_post;
 
-    // 이력을 동결 시점 스냅샷에서 마지막 한 건을 뺀 상태로 되감는다(업스트림 :424 + :426).
-    // 공백 구간에 쌓인 비관측 항목이 여기서 버려지므로 이력이 공백마다 늘어나지 않는다.
-    // 스냅샷이 접두이므로(헤더 pushes_at_freeze 주석의 불변식) 되감기에 복사가 없다 —
-    // 복사도, 보관도 없다. 이식은 되감기 없이 현재 이력에서 한 건만 빼고 스냅샷을 영구
-    // 보관해, 트랙 하나가 전량 이력을 셋(현재 + new_history + 스냅샷) 들고 있었다.
-    // pushes_at_freeze = 0 은 업스트림의 attr_saved = None(:425) 에 해당한다.
-    // 되감기를 **상대 개수**로 계산한다. 동결 뒤 붙은 것(공백 구간의 비관측 항목들과
-    // 방금 붙은 관측)을 전부 떼고, 업스트림의 `[:-1]` 에 해당하는 한 건을 더 뗀다.
-    // 절대 길이를 쓰면 앞을 잘라낸 뒤에는 다른 지점을 가리킨다.
+    // Rewind the history to the freeze-time snapshot minus its last entry
+    // (upstream :424 and :426). The non-observations collected during the gap are
+    // dropped here, so the history does not grow with every gap. The snapshot is
+    // a prefix (see the pushes_at_freeze comment in the header), so the rewind
+    // copies nothing and stores nothing. The port instead removed one entry from
+    // the current history and kept the snapshot forever, leaving a track holding
+    // three full histories: current, new_history, and snapshot.
+    // pushes_at_freeze = 0 matches upstream's attr_saved = None (:425).
+    //
+    // The rewind is computed as a relative count: drop everything appended since
+    // the freeze (the gap's non-observations plus the observation just added),
+    // then one more for upstream's `[:-1]`. An absolute length would point
+    // somewhere else once the front has been trimmed.
     const std::size_t appended = total_pushes - attr_saved.pushes_at_freeze;
     if (history_obs.size() > appended + 1) {
         history_obs.resize(history_obs.size() - appended - 1);

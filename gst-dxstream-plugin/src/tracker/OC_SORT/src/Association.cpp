@@ -105,17 +105,18 @@ Eigen::MatrixXf giou_batch(const Eigen::MatrixXf &bboxes1,
     Eigen::MatrixXf wc = xxc2 - xxc1;
     Eigen::MatrixXf hc = yyc2 - yyc1;
 
-    // 업스트림의 `assert((wc > 0).all() and (hc > 0).all())` 자리다 (association.py).
-    // **사전조건 확인이지 분기가 아니다** — 이식본은 이것을 뒤집힌 if 로 옮겨,
-    // 조건이 참인 정상 경로에서 GIoU 대신 **평범한 IoU 를 돌려주고** 있었다.
-    // 유효한 상자라면 xxc2 > xxc1 이므로 조건은 사실상 항상 참이고, 결과적으로
-    // 이 함수는 이름과 달리 IoU 함수였다. 퇴화 상자에서는 0 나눗셈이 되므로
-    // 죽는 대신 IoU 로 물러난다 — GStreamer 파이프라인에서 abort 는 선택지가 아니다.
+    // Upstream has `assert((wc > 0).all() and (hc > 0).all())` here
+    // (association.py). That is a precondition check, not a branch. The port
+    // turned it into an inverted if, so the normal path — where the condition
+    // holds — returned plain IoU instead of GIoU. For valid boxes xxc2 > xxc1 is
+    // always true, so this function was an IoU function despite its name.
+    // Degenerate boxes would divide by zero, so fall back to IoU rather than
+    // assert: aborting is not an option inside a GStreamer pipeline.
     if (!((wc.array() > 0).all() && (hc.array() > 0).all()))
         return iou;
 
     Eigen::MatrixXf area_enclose = wc.array() * hc.array();
-    // 빼는 것은 **합집합**(위 `Sum`)이다. 이식본은 교집합(`wh`)을 빼고 있었다.
+    // Subtract the union (`Sum` above). The port subtracted the intersection.
     Eigen::MatrixXf giou =
         iou.array() - (area_enclose.array() - Sum.array()) / area_enclose.array();
     giou = (giou.array() + 1) / 2.0;
@@ -196,17 +197,18 @@ associate(Eigen::MatrixXf detections, Eigen::MatrixXf trackers,
 
     Eigen::MatrixXf iou_matrix = iou_batch(detections, trackers);
 
-    // 검출 신뢰도. 업스트림은 5열 [x1,y1,x2,y2,score] 에서 `detections[:,-1]` 을 쓴다
-    // (association.py `associate`). 이 이식본의 검출 행은 element 가 결과를 원래
-    // object_meta 로 되돌려야 해서 열이 **둘** 늘어난 7열
-    // [x1,y1,x2,y2,conf,label,input_idx] 인데(gst-dxtracker.cpp), 인덱스는 `-1 → -2` 로
-    // **하나만** 밀려 있었다. 그래서 신뢰도가 아니라 **라벨**을 읽었고,
-    // `angle_diff_cost = valid_mask * diff_angle * vdc_weight * scores` 이므로
-    // **label == 0(우리 운영의 person)이면 항 전체가 0** 이 되어 OC-SORT 의
-    // 관측 중심 방향 일치(OCM)가 통째로 꺼져 있었다. 최초 릴리스 커밋부터 그랬다.
+    // Detection confidence. Upstream reads `detections[:,-1]` from a 5-column
+    // [x1,y1,x2,y2,score] array (association.py `associate`). Rows here carry two
+    // extra columns so the element can map results back to the original object
+    // meta — [x1,y1,x2,y2,conf,label,input_idx] — but the index was shifted by
+    // one (-1 to -2) instead of two. It therefore read the label, and since
+    // `angle_diff_cost = valid_mask * diff_angle * vdc_weight * scores`, a label
+    // of 0 zeroed the whole term. That is `person`, so observation-centric
+    // momentum has been off in every deployment since the first release commit.
     //
-    // 이 파일 밖의 모든 접근은 절대 인덱스다(OCSort.cpp: col(4)=conf, (_,5)=cls,
-    // (_,6)=input_idx). 여기만 상대 인덱스라 열이 늘 때 조용히 어긋났다 — 맞춰 둔다.
+    // Every other access uses absolute indices (OCSort.cpp: col(4)=conf,
+    // (_,5)=cls, (_,6)=input_idx). This was the only relative one, which is how
+    // it drifted when columns were added. Made absolute to match.
     Eigen::MatrixXf scores =
         detections.col(4).replicate(1, trackers.rows());
 

@@ -71,20 +71,23 @@ void KalmanBoxTracker::update(Eigen::VectorXf *bbox_, int cls_, int idx_) {
     last_observation = *bbox_;
     observations[age] = *bbox_;
 
-    // 다시 읽히지 않을 관측을 버린다.
+    // Drop observations that can no longer be read.
     //
-    // `observations` 를 읽는 곳은 코드 전체에서 셋뿐이고, 전부 **최근 delta_t 개**만 본다:
-    //   ① 바로 위 이 함수의 `observations[age - dt]`  (dt = 1..delta_t)
-    //   ② `k_previous_obs()` 의 `observations_.at(cur_age - dt)` (dt = 1..delta_t)
-    //   ③ `k_previous_obs()` 의 폴백 `max_element` — 방금 넣은 이 항목이 최대 키다
-    // `age` 는 단조 증가하므로 `age - delta_t` 보다 오래된 키는 **영원히 안 읽힌다.**
-    // 업스트림(noahcao/OC_SORT)은 이것을 지우지 않는데, 30~60초짜리 MOT 클립에서는
-    // 무해하기 때문이다. 24/7 파이프라인에서는 트랙 하나가 프레임마다 한 건씩 영원히
-    // 쌓아 올린다 — 10fps 로 하루면 86만 건이다.
+    // Only three places read `observations`, and all three look at the last
+    // delta_t entries:
+    //   1. `observations[age - dt]` just above       (dt = 1..delta_t)
+    //   2. k_previous_obs(): `observations_.at(cur_age - dt)` (dt = 1..delta_t)
+    //   3. k_previous_obs() fallback max_element — the entry just inserted is
+    //      the largest key
+    // `age` only increases, so keys older than `age - delta_t` are never read
+    // again. Upstream keeps them because a 30-60 second MOT clip does not care.
+    // A 24/7 pipeline does: one track adds one entry per frame forever, which is
+    // 864,000 entries a day at 10 fps.
     //
-    // 보존 개수는 **delta_t 로 정해진다** — 상수로 박으면 설정을 바꾼 순간 조용히 틀린다.
-    // 음수 delta_t 는 설정 파일에서 막히지 않으므로(OCSort.cpp 의 stoi) 여기서 0으로 막는다;
-    // 그러지 않으면 방금 넣은 항목까지 지워 폴백이 빈 맵을 훑게 된다.
+    // How many to keep comes from delta_t. A hardcoded number would go quietly
+    // wrong the moment the setting changes. A negative delta_t is clamped to 0
+    // here; otherwise this would erase the entry just inserted and leave the
+    // fallback scanning an empty map.
     const int keep_from = age - std::max(0, delta_t);
     for (; oldest_obs_age < keep_from; ++oldest_obs_age)
         observations.erase(oldest_obs_age);

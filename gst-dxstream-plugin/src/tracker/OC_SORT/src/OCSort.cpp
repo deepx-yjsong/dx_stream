@@ -21,7 +21,7 @@ std::ostream &operator<<(std::ostream &os, const std::vector<Matrix> &v) {
 }
 
 namespace {
-/** 실패해도 던지지 않는 정수 파싱. 실패 시 기본값. */
+/** Parse an int without throwing. Returns the default on failure. */
 int parse_int_or(const std::string &s, int dflt) {
     try {
         size_t pos = 0;
@@ -31,7 +31,7 @@ int parse_int_or(const std::string &s, int dflt) {
         return dflt;
     }
 }
-/** 실패해도 던지지 않는 실수 파싱. 실패 시 기본값. */
+/** Parse a float without throwing. Returns the default on failure. */
 float parse_float_or(const std::string &s, float dflt) {
     try {
         size_t pos = 0;
@@ -52,12 +52,13 @@ void OCSort::init(const std::map<std::string, std::string, std::less<>> &params)
         return (it != params.end()) ? it->second : default_value;
     };
 
-    // 파싱은 **절대 던지지 않는다.** 예전에는 `std::stoi`/`std::stof` 를 그대로 불렀는데,
-    // `init()` 은 `gst-dxtracker.cpp` 의 chain 함수에서 **try/catch 없이** 호출된다.
-    // 그래서 `tracker_config.json` 에 `"max_age": "abc"` 나 빈 문자열이 하나만 있어도
-    // 예외가 C 코드를 거슬러 올라가 **프로세스가 그대로 죽었다**(실측: SIGABRT, core dumped).
-    // 설정 오타 하나로 엣지 데몬이 내려가는 것은 어떤 기본값보다 나쁘다 — 실패하면
-    // 문서화된 기본값을 쓴다.
+    // Parsing never throws. It used to call std::stoi / std::stof directly, so a
+    // single unreadable value in tracker_config.json — "max_age": "abc", or an
+    // empty string — threw out of init(). The element caught it and turned every
+    // frame into GST_FLOW_ERROR, and since the tracker was never constructed the
+    // next frame did the same: the pipeline stopped and stayed stopped. These
+    // are numeric tuning knobs in a file edited by hand, so an unreadable value
+    // falls back to the documented default instead.
     max_age = parse_int_or(get_param("max_age", "30"), 30);
     min_hits = parse_int_or(get_param("min_hits", "3"), 3);
     iou_threshold = parse_float_or(get_param("iou_threshold", "0.3"), 0.3f);
@@ -66,10 +67,10 @@ void OCSort::init(const std::map<std::string, std::string, std::less<>> &params)
     det_thresh = parse_float_or(get_param("det_thresh", "0.5"), 0.5f);
     delta_t = parse_int_or(get_param("delta_t", "3"), 3);
 
-    // 음수 `delta_t` 는 0 으로 정규화한다. 업스트림 파이썬은 `range(delta_t)` 이므로
-    // 0 이하가 모두 "되돌아보지 않음" 으로 같은 뜻이 된다 — 의미를 바꾸지 않으면서
-    // C++ 쪽에서 음수가 인덱스 계산에 새어 들어가는 것만 막는다
-    // (`KalmanBoxTracker::update` 의 잘라내기 상한이 이 값으로 정해진다).
+    // Clamp a negative delta_t to 0. Upstream uses range(delta_t), where every
+    // value <= 0 already means "look back at nothing", so this changes no
+    // behaviour; it only keeps a negative out of the index arithmetic here
+    // (KalmanBoxTracker::update derives its trim bound from this value).
     if (delta_t < 0)
         delta_t = 0;
 
@@ -176,15 +177,18 @@ void OCSort::PrepareTrackDataForAssociation(
     Eigen::MatrixXf &out_predicted_bbox_states, Eigen::MatrixXf &out_velocities,
     Eigen::MatrixXf &out_last_observed_bboxes,
     Eigen::MatrixXf &out_k_previous_observations_matrix) {
-    // 업스트림 순서를 지킨다: **① 전부 예측 → ② NaN 트랙 제거 → ③ 나머지로 행렬 구성**
-    // (ocsort.py: `if np.any(np.isnan(pos)): to_del.append(t)` 뒤에
+    // Keep upstream's order: predict all, drop NaN trackers, then build the
+    // matrix from what is left (ocsort.py: `if np.any(np.isnan(pos)):
+    // to_del.append(t)` followed by
     //  `for t in reversed(to_del): self.trackers.pop(t)`).
     //
-    // NaN 은 도달 가능하다. `convert_x_to_bbox` 는 `w = sqrt(x(2)*x(3))`, `h = x(2)/w` 인데
-    // 상태의 s(면적)·r(비율)에 부호 제약이 없어, 관측 없이 오래 표류하면 s 가 음수로 흐를 수
-    // 있다. `predict()` 의 가드는 `x(6)+x(2) <= 0` 일 때 s 의 속도만 0 으로 만들고 s 자체를
-    // 막지 못한다. NaN 이 나오면 IoU 비교와 헝가리안 비용까지 전파되고, 이식본은 그 트랙을
-    // 지우지 않아 max_age 까지 남는다 — 그동안 연관 판정 전체가 오염된다.
+    // NaN is reachable. convert_x_to_bbox computes w = sqrt(x(2)*x(3)) and
+    // h = x(2)/w, and nothing constrains the sign of s (area) or r (ratio) in the
+    // state, so s can drift negative while a track coasts without observations.
+    // The guard in predict() only zeroes s's velocity when x(6)+x(2) <= 0; it
+    // does not bound s itself. A NaN then spreads into the IoU comparisons and
+    // the assignment costs, and the port kept such a track until max_age — every
+    // association decision in between is affected.
     std::vector<size_t> nan_indices;
     std::vector<Eigen::RowVectorXf> positions;
     positions.reserve(this->trackers.size());
@@ -319,8 +323,8 @@ void OCSort::PerformByteAssociation(
     if (u_trks_predictions.rows() == 0)
         return;
 
-    // 업스트림은 여기서 `self.asso_func` 를 쓴다(ocsort.py). 이식본은 giou_batch 를
-    // 하드코딩해 `asso_func` 설정이 죽어 있었다 — 대입만 되고 호출되는 곳이 없었다.
+    // Upstream calls self.asso_func here (ocsort.py). The port hardcoded
+    // giou_batch, so the asso_func setting was assigned and never used.
     Eigen::MatrixXf iou_values =
         this->asso_func(low_conf_dets.leftCols(4), u_trks_predictions.leftCols(4));
     if (iou_values.rows() == 0 || iou_values.cols() == 0 ||
@@ -373,7 +377,7 @@ void OCSort::PerformIOUReAssociation(
         current_unmatched_trks_last_boxes_subset.rows() == 0)
         return;
 
-    // 업스트림과 같이 `asso_func` 를 쓴다(위 PerformByteAssociation 주석 참고).
+    // Use asso_func, as upstream does (see the PerformByteAssociation comment).
     Eigen::MatrixXf iou_values =
         this->asso_func(current_unmatched_dets_subset.leftCols(4),
                         current_unmatched_trks_last_boxes_subset.leftCols(4));
@@ -457,8 +461,9 @@ std::vector<Eigen::RowVectorXf> OCSort::GenerateOutputAndCleanup() {
              (this->frame_count <= this->min_hits))) {
 
             Eigen::Matrix<float, 1, 4> d_bbox_coords;
-            // 업스트림은 `trk.last_observation.sum() < 0` 로 판정한다 (ocsort.py).
-            // 첫 성분만 보면 초기 표식 이외의 조합에서 갈릴 수 있으므로 합으로 맞춘다.
+            // Upstream tests trk.last_observation.sum() < 0 (ocsort.py). Checking
+            // only the first element could disagree for values other than the
+            // initial sentinel, so use the sum.
             bool has_valid_last_obs =
                 (tracker->get_last_observation().size() >= 4 &&
                  tracker->get_last_observation().sum() >= 0.0f);
