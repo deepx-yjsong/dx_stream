@@ -1,13 +1,20 @@
-// dxtracker config contract — a value the tracker cannot read must fail the
-// pipeline, not the process.
+// dxtracker config contract — a numeric value the parser cannot read must not
+// cost the camera its analytics.
 //
-// This is an element contract, not an algorithm one, and that placement is the
-// whole point. Two designs are defensible when a config value will not parse:
-// substitute a default and carry on, or refuse to start. A check inside the
-// tracker library has to pick one, and would then fail a different tracker for
-// making the other choice. What holds either way is that the process must still
-// be alive to report what happened — and only a test that owns the process can
-// assert that.
+// SCOPE, STATED HONESTLY. This is not a law about trackers. When a config value
+// will not parse, two designs are defensible: substitute the documented default
+// and carry on, or refuse to start and say so. This element chooses the first,
+// and the choice is deliberate — tracker_config.json is edited by hand by
+// operators, the values here are numeric tuning knobs rather than things the
+// tracker cannot run without, and a 24/7 recorder should not lose a camera's
+// analytics over a stray character. The check below therefore FAILS a tracker
+// that chooses the second design. That is a regression guard on a decision, not
+// a universal truth, and anyone porting this file to an element that decided the
+// other way should change the assertion rather than the implementation.
+//
+// What IS universal, and what the check also covers by simply completing: the
+// failure must not remove the process. `init()` is called from a GStreamer chain
+// function, and an exception that escapes it unwinds through C frames.
 //
 // WHY THIS NEEDS A TEST
 //
@@ -24,9 +31,9 @@
 // build that had no try/catch to speak of. A test can name a guarantee the code
 // does not have; only exercising the path finds that out.
 //
-// This test does not assert which error surfaces, or that one surfaces at all —
-// an implementation that substitutes defaults and runs normally is passing
-// behaviour. It asserts that the process reaches the end of the function.
+// The check does not assert which error surfaces or that one surfaces at all.
+// It asserts three things: the pipeline keeps accepting buffers, the tracker
+// keeps assigning ids, and the process reaches the end of the function.
 
 #include <gst/check/gstcheck.h>
 #include <gst/check/gstharness.h>
