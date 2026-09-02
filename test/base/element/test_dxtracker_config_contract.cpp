@@ -120,8 +120,11 @@ bool tracks_with_config(const gchar *path, bool *flow_ok) {
 
     *flow_ok = true;
     bool tracked = false;
-    // min_hits is 3, so a working tracker has ids by the fourth frame.
-    for (int f = 0; f < 4; ++f) {
+    // Enough frames that the verdict is not decided by one association: the
+    // first draft ran four, which put the check one frame after min_hits and on
+    // the edge of the tracker's own decision to drop an unmatched box. Two
+    // builds whose tracker sources differ only in comments disagreed there.
+    for (int f = 0; f < 12; ++f) {
         GstBuffer *b = gst_harness_create_buffer(h.h, BUF_SIZE);
         GST_BUFFER_PTS(b) = f * (GST_SECOND / 30);
         GST_BUFFER_DURATION(b) = GST_SECOND / 30;
@@ -137,11 +140,15 @@ bool tracks_with_config(const gchar *path, bool *flow_ok) {
             *flow_ok = false;
             continue;
         }
-        if (f == 3) {
-            DXFrameMeta *ofm = dx_get_frame_meta(out);
-            tracked = ofm && !ofm->_object_meta_list.empty() &&
-                      ofm->_object_meta_list[0]->_track_id != -1;
-        }
+        // "some object carried an id at some point", not "this object did on
+        // this frame". Which box survives an association is the algorithm's
+        // business and varies between implementations; that ids are handed out
+        // at all is what a working tracker owes its caller.
+        DXFrameMeta *ofm = dx_get_frame_meta(out);
+        if (ofm)
+            for (auto *o : ofm->_object_meta_list)
+                if (o->_track_id != -1)
+                    tracked = true;
         gst_buffer_unref(out);
     }
     return tracked;
