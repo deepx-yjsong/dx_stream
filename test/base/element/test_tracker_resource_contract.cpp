@@ -382,8 +382,8 @@ GST_END_TEST;
 #endif
 
 #if !DXTEST_HAVE_HEAP_PROBE
-// 건너뛴 사실은 러너가 출력을 캡처하는 시점에 알려야 한다 — suite 구성 함수에서
-// 찍으면 프레임워크에 따라 유실되거나 순서가 섞인다.
+// Report the skip from inside a test, where the runner captures output. Printing
+// it from the suite builder can be dropped or reordered by the framework.
 GST_START_TEST(TR_retention_check_unavailable) {
     g_print("[INFO] retention check skipped: needs mallinfo2 (glibc >= 2.33)\n");
 }

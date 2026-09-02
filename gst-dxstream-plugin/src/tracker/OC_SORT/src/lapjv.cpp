@@ -34,31 +34,38 @@
 #endif
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 할당 문제 솔버 — Jonker-Volgenant 계열 최단증강경로 + 듀얼 포텐셜, O(n³).
+// Assignment solver — Jonker-Volgenant shortest augmenting path with dual
+// potentials, O(n^3).
 //
-// **왜 교체했나** (2026-08-31, 이슈 #83)
-// 종전 구현(약 700줄, JV 를 헬퍼 20여 개로 재구성한 것)은 **직사각 비용 행렬에서
-// 최적해를 놓쳤다.** 정사각(8·16·32·64)은 0/20 로 정확한데 직사각은 8×6 1/20 ·
-// 16×12 6/20 · 32×24 14/20 · **50×40 20/20** 로 실패했고, 총비용 손실이 최대 약 2% 였다.
-// OC-SORT 의 연관 행렬은 `검출 수 × 트랙 수` 라 **사실상 항상 직사각**이므로 상시 발동했다.
-// 결함이 "틀린 값"이 아니라 "덜 좋은 값"이라 예외도 로그도 남기지 않는다 —
-// 독립 구현과 대조해야만 보인다.
+// WHY THIS WAS REPLACED
+// The previous implementation (~700 lines, JV split across some twenty helpers)
+// returned suboptimal assignments on rectangular cost matrices. Square inputs
+// (8, 16, 32, 64) were correct in 0/20 failures; rectangular ones failed 1/20 at
+// 8x6, 6/20 at 16x12, 14/20 at 32x24 and 20/20 at 50x40, with total cost up to
+// about 2% above optimal. OC-SORT's association matrix is detections x trackers,
+// so it is almost never square and this fired routinely. The result was a worse
+// answer rather than a wrong one, so there was no exception and no log line —
+// it is only visible against an independent implementation.
 //
-// **왜 원본을 직역하지 않았나.** 업스트림 OC-SORT 는 `lap.lapjv` 라이브러리를 부르고,
-// 그 라이브러리는 실측에서 전 케이스 최적이었다(scipy 와 일치). 그런데 공개된
-// `gatagat/lap` master 의 `_lapjv_cpp/lapjv.cpp` 를 그대로 옮겨 보니 **종전 구현과 똑같이
-// 비최적**이었다 — 배포된 `lap` 0.5.13 의 실제 동작을 그 소스로 재현하지 못했다.
-// 패딩 규칙(`np.zeros`)·정밀도(double)·`cost_limit` 취급까지 맞춰도 마찬가지였다.
-// 원인을 특정하지 못한 채 추측으로 맞춰 가는 대신, **정확성을 우리가 직접 증명할 수 있는
-// 구현**으로 갈아끼운다.
+// WHY NOT TRANSCRIBE THE ORIGINAL
+// Upstream OC-SORT calls the lap.lapjv library, which was optimal on every case
+// tested (it agrees with scipy). But transcribing the published
+// gatagat/lap master _lapjv_cpp/lapjv.cpp gave exactly the same suboptimal
+// results as the old code: that source does not reproduce what the shipped lap
+// 0.5.13 actually does. Matching its padding (np.zeros), precision (double) and
+// cost_limit handling changed nothing. Rather than keep guessing at a difference
+// we could not identify, this uses an implementation whose correctness we can
+// demonstrate ourselves.
 //
-// **검증** (`execLapjv` 단위, 씨앗 20개):
-//   - 완전탐색(작은 크기) · `scipy.optimize.linear_sum_assignment` · `lap.lapjv` 셋과 대조
-//   - 정사각·직사각·극단 형태(1×N, N×1) 전부 최적
+// VERIFICATION (at the execLapjv level, 20 seeds):
+//   - checked against brute force (small sizes), scipy.optimize.
+//     linear_sum_assignment, and lap.lapjv
+//   - optimal on square, rectangular and degenerate shapes (1xN, Nx1)
 //
-// 패딩된 더미 행/열은 균일하므로(전 열에 같은 값) 어떤 완전매칭에도 같은 상수만 더한다 —
-// 즉 채움값이 최적해를 바꾸지 않는다. 이건 **올바른 솔버에서만** 성립하는 성질이고,
-// 종전 구현이 채움값에 따라 결과가 달라졌던 것 자체가 결함의 증상이었다.
+// Padded dummy rows and columns are uniform (the same value across the row), so
+// they add the same constant to every perfect matching: the fill value cannot
+// change the optimum. That only holds for a correct solver — the old code's
+// answer depending on the fill value was itself a symptom of the defect.
 // ─────────────────────────────────────────────────────────────────────────────
 int lapjv_internal(const uint_t n, cost_t *const *cost, int_t *x_data,
                    int_t *y_data) {
@@ -68,7 +75,8 @@ int lapjv_internal(const uint_t n, cost_t *const *cost, int_t *x_data,
     const cost_t INF = std::numeric_limits<cost_t>::infinity();
     const size_t N = static_cast<size_t>(n);
 
-    // 1-기반 내부 표기(고전 JV 서술 그대로). p[j] = 열 j 에 배정된 행, 0 이면 미배정.
+    // 1-based internally, as in the classic JV description. p[j] is the row
+    // assigned to column j, or 0 if unassigned.
     std::vector<cost_t> u(N + 1, 0), v(N + 1, 0), minv(N + 1);
     std::vector<size_t> p(N + 1, 0), way(N + 1, 0);
     std::vector<char> used(N + 1);
@@ -99,7 +107,7 @@ int lapjv_internal(const uint_t n, cost_t *const *cost, int_t *x_data,
                 }
             }
             if (j1 == 0)
-                return -1;   // 도달 불가 — 비용에 NaN/Inf 가 섞인 경우
+                return -1;   // unreachable: the costs contain NaN or Inf
 
             for (size_t j = 0; j <= N; ++j) {
                 if (used[j]) {
@@ -112,7 +120,7 @@ int lapjv_internal(const uint_t n, cost_t *const *cost, int_t *x_data,
             j0 = j1;
         } while (p[j0] != 0);
 
-        // 증강 경로를 따라 되짚으며 배정을 옮긴다.
+        // Walk back along the augmenting path, shifting assignments.
         do {
             const size_t j1 = way[j0];
             p[j0] = p[j1];

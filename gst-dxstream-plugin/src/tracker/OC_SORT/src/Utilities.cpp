@@ -28,10 +28,11 @@ Eigen::VectorXf convert_x_to_bbox(Eigen::VectorXf x) {
     bbox << x(0) - w / 2, x(1) - h / 2, x(0) + w / 2, x(1) + h / 2;
     return bbox;
 }
-// 관측 맵은 참조로 받는다. 업스트림 참조 구현은 파이썬 dict 를 넘기므로 참조 전달인데
-// (noahcao/OC_SORT ocsort.py:11), C++ 이식만 값 전달이었다. 호출 지점(OCSort.cpp:152)이
-// "매 프레임 × 살아 있는 트랙 전부" 루프라 트랙이 오래 살수록 프레임당 복사량이 선형으로
-// 커진다 — 21.5시간 가동에서 처리량이 57% 떨어진 원인이다(dx_argus #61).
+// The observations map is taken by reference. Upstream passes a Python dict,
+// which is already a reference (noahcao/OC_SORT ocsort.py:11); only this port
+// passed by value. The call site (OCSort.cpp) runs once per live track per
+// frame, so the copy grows with track age. Measured: 57% throughput loss after
+// 21.5 hours.
 Eigen::VectorXf
 k_previous_obs(const std::unordered_map<int, Eigen::VectorXf> &observations_,
                int cur_age, int k) {
