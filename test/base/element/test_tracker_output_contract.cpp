@@ -6,6 +6,13 @@
 // property of one algorithm: no check below references OC_SORT types. To cover
 // another implementation, change TRACKER, the parameter map, and PROBED_PARAMS.
 //
+// What a tracker should do with a malformed config value is NOT here. Falling
+// back to a default and refusing to start are both defensible, so a library-level
+// check has to pick one and would fail a different implementation for a choice
+// that is not wrong. The contract that holds either way — a bad value must not
+// take the process down — is testable only where the process is, and lives in
+// test_dxtracker_config_contract.cpp.
+//
 // WHY THESE CONTRACTS NEED TESTS
 //
 // Both defects these checks pin down were present from this port's initial
@@ -64,19 +71,29 @@ std::map<std::string, std::string, std::less<>> tracker_params() {
 
 // Settings whose effect the tracker must be able to demonstrate, each with two
 // values far enough apart that a live implementation cannot produce the same
-// output for both on MOVING_SCENE. Anything listed here that the algorithm
-// silently ignores is a defect in the algorithm or in its parameter plumbing;
-// a setting the algorithm genuinely does not have belongs out of this list, not
-// in it with a shrug.
+// output for both on `moving_scene`.
+//
+// OBLIGATION WHEN THIS LIST CHANGES. A failure here has two possible causes and
+// they are not distinguishable from the result alone: the setting is ignored, or
+// the scene does not exercise it. Before removing an entry, establish which —
+// deleting a probe that is telling the truth removes the only signal this class
+// of defect produces. Before adding one, check that `moving_scene` can move it;
+// two of these were unprobeable until the scene was given a spread of detection
+// confidences, and a probe that cannot fail is worse than no probe.
 struct ProbedParam {
     const char *key;
     const char *lo;
     const char *hi;
 };
 const std::vector<ProbedParam> PROBED_PARAMS = {
-    {"delta_t", "1", "9"},
-    {"inertia", "0.05", "0.9"},
+    {"delta_t", "1", "9"},           // observation-centric momentum: lookback
+    {"inertia", "0.05", "0.9"},      // observation-centric momentum: weight
+    {"asso_func", "iou", "giou"},    // association metric
     {"iou_threshold", "0.15", "0.6"},
+    {"min_hits", "1", "8"},
+    {"max_age", "2", "60"},
+    {"det_thresh", "0.1", "0.85"},
+    {"use_byte", "false", "true"},
 };
 
 struct Det {
@@ -95,7 +112,12 @@ Eigen::MatrixXf make_dets(const std::vector<Det> &ds) {
         m(r, 1) = ds[i].y1;
         m(r, 2) = ds[i].x2;
         m(r, 3) = ds[i].y2;
-        m(r, 4) = 0.9f;                  // conf, well above det_thresh
+        // A spread, not a constant: with every detection at the same confidence
+        // the settings that key off it (`det_thresh`, `use_byte`) cannot be
+        // probed at all, and a real detector never produces one anyway. The
+        // range straddles the configured det_thresh so both the high- and
+        // low-confidence association paths carry traffic.
+        m(r, 4) = 0.25f + 0.14f * static_cast<float>(i);
         m(r, 5) = 0.0f;                  // label: person
         m(r, 6) = static_cast<float>(i);
     }
@@ -251,8 +273,10 @@ GST_START_TEST(TO_declared_parameters_are_observable) {
                     break;
                 }
 
-        g_print("[DIAG] %-14s %s vs %s: rows %zu vs %zu, %s\n", pp.key, pp.lo,
-                pp.hi, lo.size() / 8, hi.size() / 8,
+        // Values, not rows: the row width is the algorithm's business and this
+        // file does not assume one.
+        g_print("[DIAG] %-14s %-6s vs %-6s: %zu vs %zu values, %s\n", pp.key,
+                pp.lo, pp.hi, lo.size(), hi.size(),
                 identical ? "IDENTICAL" : "differs");
 
         if (identical)
@@ -267,59 +291,10 @@ GST_START_TEST(TO_declared_parameters_are_observable) {
         names += (names.empty() ? "" : ", ") + d;
     fail_unless(dead.empty(),
                 "%zu setting(s) produced byte-identical output across their "
-                "probe values and are accepted then ignored: %s",
+                "probe values: %s. Either the setting reaches nothing, or "
+                "moving_scene does not exercise it — establish which before "
+                "changing PROBED_PARAMS",
                 dead.size(), names.c_str());
-}
-GST_END_TEST;
-
-// ---------------------------------------------------------------------------
-// Config values arrive as JSON strings from a file operators edit by hand, so a
-// value the parser cannot read is one typo away, not a hypothetical. Whatever
-// the tracker does with it, `init` must return: it is called from the element's
-// chain function, and an exception thrown there unwinds through C frames and
-// takes the process down with SIGABRT rather than failing the pipeline.
-//
-// The contract is "init returns and the tracker is still usable", not "these
-// specific defaults are chosen" — an implementation may reasonably clamp,
-// substitute, or ignore, and all three are fine as long as the process lives.
-// ---------------------------------------------------------------------------
-GST_START_TEST(TO_init_survives_malformed_values) {
-    const std::vector<std::pair<const char *, const char *>> junk = {
-        {"max_age", "abc"},        // not a number at all
-        {"max_age", ""},           // empty string
-        {"delta_t", "3.5.1"},      // trailing garbage after a valid prefix
-        {"min_hits", "-"},         // sign with no digits
-        {"iou_threshold", "1e999"},// parses, then overflows
-        {"inertia", "  "},         // whitespace only
-    };
-
-    for (const auto &kv : junk) {
-        auto params = tracker_params();
-        params[kv.first] = kv.second;
-
-        auto trk = TrackerFactory::createTracker(TRACKER);
-        bool threw = false;
-        try {
-            trk->init(params);
-            // Still has to work afterwards: surviving init and then faulting on
-            // the first frame is the same outage one function later.
-            trk->update(make_dets(moving_scene(0)));
-            trk->update(make_dets(moving_scene(1)));
-        } catch (const std::exception &e) {
-            threw = true;
-            g_print("[DIAG] %s=\"%s\" threw: %s\n", kv.first, kv.second, e.what());
-        } catch (...) {
-            threw = true;
-            g_print("[DIAG] %s=\"%s\" threw a non-std exception\n", kv.first,
-                    kv.second);
-        }
-
-        fail_unless(!threw,
-                    "'%s' = \"%s\" threw out of init/update — from the element's "
-                    "chain function this unwinds through C frames and aborts the "
-                    "process",
-                    kv.first, kv.second);
-    }
 }
 GST_END_TEST;
 
@@ -330,7 +305,6 @@ static Suite *tracker_output_contract_suite(void) {
     suite_add_tcase(s, tc);
     tcase_add_test(tc, TO_emitted_boxes_are_real);
     tcase_add_test(tc, TO_declared_parameters_are_observable);
-    tcase_add_test(tc, TO_init_survives_malformed_values);
     return s;
 }
 
