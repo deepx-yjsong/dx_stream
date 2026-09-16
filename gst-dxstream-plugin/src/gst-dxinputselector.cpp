@@ -139,7 +139,7 @@ gst_dxinputselector_sink_event(GstAggregator *agg, GstAggregatorPad *pad,
 }
 
 static GstFlowReturn
-gst_dxinputselector_aggregate(GstAggregator *agg, gboolean /*timeout*/) {
+gst_dxinputselector_aggregate(GstAggregator *agg, gboolean timeout) {
     GstDxInputSelector *self = GST_DXINPUTSELECTOR(agg);
 
     GstClockTime min_pts = GST_CLOCK_TIME_NONE;
@@ -168,6 +168,18 @@ gst_dxinputselector_aggregate(GstAggregator *agg, gboolean /*timeout*/) {
         all_done = FALSE;
         GstBuffer *buf = gst_aggregator_pad_peek_buffer(pad);
         if (!buf) {
+            /* Live deadline expired: GstAggregator already waited on the clock
+             * for `latency`, so leave this pad out of this round instead of
+             * blocking every other stream on it.  This is the contract stated
+             * in gstaggregator.c: "Otherwise (i.e. if we are live!), we wait on
+             * the clock and if a pad does not have a buffer in time we ignore
+             * that pad."
+             *
+             * Skipping relaxes strict cross-pad PTS ordering, which is why it
+             * is done only once the deadline has passed.  With non-live
+             * upstream `timeout` is never TRUE and this branch never runs, so
+             * file-based pipelines keep the exact previous behaviour. */
+            if (timeout) continue;
             GST_OBJECT_UNLOCK(agg);
             for (auto &p : peeked) gst_buffer_unref(p.second);
             return GST_AGGREGATOR_FLOW_NEED_DATA;
@@ -268,6 +280,14 @@ static void gst_dxinputselector_class_init(GstDxInputSelectorClass *klass) {
     agg_class->stop = GST_DEBUG_FUNCPTR(gst_dxinputselector_stop);
     agg_class->src_query = GST_DEBUG_FUNCPTR(gst_dxinputselector_src_query);
     agg_class->sink_query = GST_DEBUG_FUNCPTR(gst_dxinputselector_sink_query);
+    /* Without a get_next_time the base class has no deadline to wait for
+     * (gst_aggregator_get_next_time() returns GST_CLOCK_TIME_NONE by default),
+     * so gst_aggregator_wait_and_check() takes the unbounded SRC_WAIT branch
+     * and never sets `timeout` -- which makes the inherited `latency` property
+     * a no-op.  The simple implementation bases the deadline on the srcpad
+     * segment position, which is what GStreamer documents for "a live source
+     * and a dead line based aggregator subclass". */
+    agg_class->get_next_time = gst_aggregator_simple_get_next_time;
 }
 
 static void gst_dxinputselector_init(GstDxInputSelector *self) {
