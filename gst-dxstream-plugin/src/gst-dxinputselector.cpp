@@ -17,6 +17,7 @@ static GstStaticPadTemplate sink_template = GST_STATIC_PAD_TEMPLATE(
 static GstStaticPadTemplate src_template = GST_STATIC_PAD_TEMPLATE(
     "src", GST_PAD_SRC, GST_PAD_ALWAYS, GST_STATIC_CAPS(DX_VIDEORAW_CAPS_STR));
 
+static GstClockTime gst_dxinputselector_get_next_time(GstAggregator *agg);
 static GstFlowReturn gst_dxinputselector_aggregate(GstAggregator *agg,
                                                     gboolean timeout);
 static gboolean gst_dxinputselector_sink_event(GstAggregator *agg,
@@ -136,6 +137,49 @@ gst_dxinputselector_sink_event(GstAggregator *agg, GstAggregatorPad *pad,
                                                     gst_event_ref(event)));
         return GST_AGGREGATOR_CLASS(parent_class)->sink_event(agg, pad, event);
     }
+}
+
+/* When the next buffer is due: the running time of the earliest buffer we
+ * currently hold.  The base class waits until that moment plus `latency`
+ * before calling aggregate() with timeout=TRUE.
+ *
+ * Returning GST_CLOCK_TIME_NONE while no pad holds a buffer is essential, not
+ * an edge case: it puts the base class on the unbounded SRC_WAIT branch so the
+ * srcpad task sleeps until data arrives.  gst_aggregator_simple_get_next_time()
+ * is wrong here -- it reads the srcpad segment position, which this element
+ * never advances, so it yields a deadline permanently in the past and the
+ * srcpad task spins through empty aggregate() rounds at 100% CPU.  That helper
+ * suits subclasses that produce output on a fixed cadence (videoaggregator,
+ * audioaggregator); a timestamp-ordered muxer must derive the deadline from
+ * its inputs, as gst_base_ts_mux_get_next_time() does.
+ */
+static GstClockTime gst_dxinputselector_get_next_time(GstAggregator *agg) {
+    GstClockTime best = GST_CLOCK_TIME_NONE;
+    gboolean have_buffer = FALSE;
+
+    GST_OBJECT_LOCK(agg);
+    for (GList *l = GST_ELEMENT(agg)->sinkpads; l; l = l->next) {
+        GstAggregatorPad *pad = GST_AGGREGATOR_PAD(l->data);
+        GstBuffer *buf = gst_aggregator_pad_peek_buffer(pad);
+        if (!buf)
+            continue;
+        have_buffer = TRUE;
+        GstClockTime pts = GST_BUFFER_PTS(buf);
+        if (GST_CLOCK_TIME_IS_VALID(pts)) {
+            GstClockTime rt = gst_segment_to_running_time(
+                &pad->segment, GST_FORMAT_TIME, pts);
+            if (GST_CLOCK_TIME_IS_VALID(rt) &&
+                (!GST_CLOCK_TIME_IS_VALID(best) || rt < best))
+                best = rt;
+        }
+        gst_buffer_unref(buf);
+    }
+    GST_OBJECT_UNLOCK(agg);
+
+    /* Buffers without a timestamp are aggregated immediately. */
+    if (have_buffer && !GST_CLOCK_TIME_IS_VALID(best))
+        return 0;
+    return best;
 }
 
 static GstFlowReturn
@@ -284,10 +328,9 @@ static void gst_dxinputselector_class_init(GstDxInputSelectorClass *klass) {
      * (gst_aggregator_get_next_time() returns GST_CLOCK_TIME_NONE by default),
      * so gst_aggregator_wait_and_check() takes the unbounded SRC_WAIT branch
      * and never sets `timeout` -- which makes the inherited `latency` property
-     * a no-op.  The simple implementation bases the deadline on the srcpad
-     * segment position, which is what GStreamer documents for "a live source
-     * and a dead line based aggregator subclass". */
-    agg_class->get_next_time = gst_aggregator_simple_get_next_time;
+     * a no-op. */
+    agg_class->get_next_time =
+        GST_DEBUG_FUNCPTR(gst_dxinputselector_get_next_time);
 }
 
 static void gst_dxinputselector_init(GstDxInputSelector *self) {
