@@ -484,6 +484,25 @@ gboolean handle_custom_downstream_event(GstDxInfer *self, GstEvent *event) {
             } else {
                 gst_event_unref(event);
             }
+
+            /* Release the latch: it only guards the drain above.
+             *
+             * Once this stream's in-flight buffers are gone and its EOS has
+             * been forwarded, the stream is over and dxinputselector is free
+             * to hand the slot to another source -- stream ids are a reused
+             * free list in dynamic deployments.  Left latched, every buffer of
+             * the *next* source on that id is dropped at the head of
+             * gst_dxinfer_chain(), silently and forever: there is no per-stream
+             * erase, and the two clear() sites are FLUSH_STOP and
+             * READY->PAUSED, neither of which a re-attach performs.
+             *
+             * No buffer of the old stream can arrive after this point: the
+             * per-stream EOS travels in-band with them, so pad ordering puts
+             * it last. */
+            {
+                std::lock_guard<std::mutex> lock(self->_eos_ctx.eos_lock);
+                self->_eos_ctx.stream_eos_arrived.erase(stream_id);
+            }
         } else {
             res = gst_pad_push_event(self->_srcpad, event);
         }
