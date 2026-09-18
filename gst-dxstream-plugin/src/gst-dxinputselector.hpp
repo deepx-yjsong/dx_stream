@@ -15,6 +15,11 @@ struct _GstDxInputSelector {
     GstAggregator parent_instance;
     std::set<int> _stream_eos_sent;
     guint _max_queue_size;
+    /* Pads left out of an aggregation round because the live deadline passed.
+     * Read-only "pads-skipped" property: the deadline is a tolerance for
+     * inter-stream arrival skew, and without a count there is no way to tell a
+     * value that is too small (skipping constantly) from one that never fires. */
+    guint64 _pads_skipped;
 };
 
 G_END_DECLS

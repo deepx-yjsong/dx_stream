@@ -9,7 +9,7 @@
 GST_DEBUG_CATEGORY_STATIC(gst_dxinputselector_debug_category);
 #define GST_CAT_DEFAULT gst_dxinputselector_debug_category
 
-enum class PropertyID { PROP_0, PROP_MAX_QUEUE_SIZE };
+enum class PropertyID { PROP_0, PROP_MAX_QUEUE_SIZE, PROP_PADS_SKIPPED };
 
 static GstStaticPadTemplate sink_template = GST_STATIC_PAD_TEMPLATE(
     "sink_%u", GST_PAD_SINK, GST_PAD_REQUEST, GST_STATIC_CAPS("video/x-raw"));
@@ -56,6 +56,8 @@ static void gst_dxinputselector_get_property(GObject *object, guint prop_id,
     const auto *self = GST_DXINPUTSELECTOR(object);
     if (static_cast<PropertyID>(prop_id) == PropertyID::PROP_MAX_QUEUE_SIZE) {
         g_value_set_uint(value, self->_max_queue_size);
+    } else if (static_cast<PropertyID>(prop_id) == PropertyID::PROP_PADS_SKIPPED) {
+        g_value_set_uint64(value, self->_pads_skipped);
     } else {
         G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
     }
@@ -223,7 +225,10 @@ gst_dxinputselector_aggregate(GstAggregator *agg, gboolean timeout) {
              * is done only once the deadline has passed.  With non-live
              * upstream `timeout` is never TRUE and this branch never runs, so
              * file-based pipelines keep the exact previous behaviour. */
-            if (timeout) continue;
+            if (timeout) {
+                self->_pads_skipped++;
+                continue;
+            }
             GST_OBJECT_UNLOCK(agg);
             for (auto &p : peeked) gst_buffer_unref(p.second);
             return GST_AGGREGATOR_FLOW_NEED_DATA;
@@ -305,6 +310,21 @@ static void gst_dxinputselector_class_init(GstDxInputSelectorClass *klass) {
             (GParamFlags)(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS |
                           GST_PARAM_MUTABLE_READY)));
 
+    /* How many times a pad was left out of a round because the live deadline
+     * passed.  The `latency` deadline is a tolerance for inter-stream arrival
+     * skew; without this count there is no way to distinguish a value that is
+     * too small (skipping on almost every round, so cross-pad ordering is
+     * routinely relaxed) from one that never fires at all -- which is how the
+     * property sat inert for a month before the deadline was implemented. */
+    g_object_class_install_property(
+        gobject_class, static_cast<guint>(PropertyID::PROP_PADS_SKIPPED),
+        g_param_spec_uint64(
+            "pads-skipped", "Pads Skipped",
+            "Cumulative count of pads left out of an aggregation round "
+            "because the live deadline expired",
+            0, G_MAXUINT64, 0,
+            (GParamFlags)(G_PARAM_READABLE | G_PARAM_STATIC_STRINGS)));
+
     gst_element_class_set_static_metadata(
         element_class, "DXInputSelector", "Generic",
         "Input Selection from Multi Channel Streams (N:1)",
@@ -340,6 +360,7 @@ static void gst_dxinputselector_init(GstDxInputSelector *self) {
     // set is touched (e.g. _stream_eos_sent.clear() in start()).
     new (&self->_stream_eos_sent) std::set<int>();
     self->_max_queue_size = 2;
+    self->_pads_skipped = 0;
 }
 
 static void gst_dxinputselector_finalize(GObject *object) {
