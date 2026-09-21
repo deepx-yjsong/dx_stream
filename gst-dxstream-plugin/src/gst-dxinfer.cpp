@@ -594,13 +594,27 @@ static gboolean gst_dxinfer_sink_event(GstPad *pad, GstObject *parent,
     case GST_EVENT_EOS: {
         GST_DEBUG_OBJECT(self, "Received EOS event");
         if (!self->_secondary_mode) {
+            /* Same bound, same reason, as the per-stream EOS drain above: this
+             * runs on the streaming thread and can only finish if the NPU keeps
+             * completing work.  Unbounded, a wedged device stops the pipeline
+             * from ever shutting down -- and global EOS is exactly the path a
+             * shutdown takes. */
             std::unique_lock<std::mutex> lock(self->_push_ctx.push_lock);
             GST_DEBUG_OBJECT(self, "EOS: waiting for %zu queued buffers to drain",
                             self->_push_ctx.push_queue.size());
-            self->_push_ctx.cv.wait(lock, [self] {
-                return self->_push_ctx.push_queue.empty() ||
-                       !self->_push_ctx.push_running;
-            });
+            const bool drained = self->_push_ctx.cv.wait_for(
+                lock, DX_EOS_DRAIN_TIMEOUT, [self] {
+                    return self->_push_ctx.push_queue.empty() ||
+                           !self->_push_ctx.push_running;
+                });
+            if (!drained) {
+                GST_WARNING_OBJECT(self,
+                    "EOS: %zu buffer(s) still queued after %llds waiting for the "
+                    "NPU to drain; forwarding EOS anyway",
+                    self->_push_ctx.push_queue.size(),
+                    (long long)std::chrono::duration_cast<std::chrono::seconds>(
+                        DX_EOS_DRAIN_TIMEOUT).count());
+            }
         }
         if (self->_push_ctx.push_running || self->_secondary_mode) {
             GST_DEBUG_OBJECT(self, "EOS: queue drained, forwarding downstream");

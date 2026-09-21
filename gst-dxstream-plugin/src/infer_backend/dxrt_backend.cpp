@@ -1,3 +1,4 @@
+#include <chrono>
 #include "dxrt_backend.hpp"
 
 #include <gst/gst.h>
@@ -75,9 +76,27 @@ bool DxrtBackend::Init(const InferBackendOptions& options) {
 
 bool DxrtBackend::Put(void* input_ptr, void* output_ptr) {
     std::unique_lock<std::mutex> lock(mutex_);
-    cv_.wait(lock, [this] {
-        return flushed_ || pending_entries_.size() < max_pending_;
-    });
+    /* Backpressure: this blocks the caller's streaming thread until the device
+     * frees a slot, and that is the right behaviour -- the leaky queue upstream
+     * absorbs it by dropping, which is how a live pipeline should degrade.
+     *
+     * What is NOT right is doing it *silently forever*.  A wedged device gives
+     * exactly the same picture as a busy one: chain() blocked, no error, no log,
+     * pipeline apparently healthy.  So keep waiting, but say so.  We do not add
+     * a deadline here on purpose: dropping under mere load would change how the
+     * pipeline degrades, and that decision belongs upstream in the queue, not
+     * in the backend. */
+    constexpr auto kStuckWarnAfter = std::chrono::seconds(10);
+    int stuck_rounds = 0;
+    while (!cv_.wait_for(lock, kStuckWarnAfter, [this] {
+               return flushed_ || pending_entries_.size() < max_pending_;
+           })) {
+        ++stuck_rounds;
+        g_warning("DxrtBackend: no free slot for %ds (pending=%zu/%zu) -- the "
+                  "device has not completed a request in that time",
+                  stuck_rounds * (int)kStuckWarnAfter.count(),
+                  pending_entries_.size(), max_pending_);
+    }
     if (flushed_) return false;
 
     int req_id = ie_->RunAsync(input_ptr, nullptr, output_ptr);
