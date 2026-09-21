@@ -41,6 +41,23 @@ struct GstDxInferEosContext {
     std::map<int, int> stream_pending_buffers;
 };
 
+/* How long a per-stream EOS waits for the NPU to drain before giving up.
+ * Generous on purpose: it is a guard against a wedged device, not a latency
+ * budget.  A healthy drain finishes in milliseconds. */
+constexpr std::chrono::seconds DX_EOS_DRAIN_TIMEOUT{5};
+
+/* Drop accounting, one counter per reason.  chain() returns GST_FLOW_OK on all
+ * of these, so without the counters a frame dropped on purpose (throttling to
+ * the configured inference rate) and a frame lost to a fault look identical
+ * from outside -- which is why #115 and #118 stayed invisible for so long.
+ * Read-only properties, the shape videorate uses for `drop`/`duplicate`. */
+struct GstDxInferDropCounters {
+    std::atomic<guint64> qos{0};        /* behind the QoS deadline */
+    std::atomic<guint64> throttled{0};  /* over the configured inference rate */
+    std::atomic<guint64> no_meta{0};    /* arrived without DXFrameMeta */
+    std::atomic<guint64> after_eos{0};  /* stream_id latched by a per-stream EOS */
+};
+
 struct GstDxInferTimingContext {
     gint64 avg_latency;
     GQueue *recent_latencies;
@@ -72,6 +89,7 @@ struct _GstDxInfer {
 
     GstDxInferPushContext _push_ctx;
     GstDxInferEosContext _eos_ctx;
+    GstDxInferDropCounters _drops;
     GstDxInferTimingContext _timing_ctx;
 };
 

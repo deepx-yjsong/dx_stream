@@ -5,7 +5,9 @@
 #include "dx_msgbrokerl_kafka.hpp"
 #include "dx_msgbrokerl_mqtt.hpp"
 
-enum class PropertyID { PROP_0, PROP_BROKER_NAME, PROP_CONN_INFO, PROP_CONFIG, PROP_TOPIC };
+enum class PropertyID { PROP_0, PROP_BROKER_NAME, PROP_CONN_INFO, PROP_CONFIG, PROP_TOPIC,
+                        PROP_MESSAGES_PUBLISHED, PROP_PUBLISH_FAILURES,
+                        PROP_BUFFERS_WITHOUT_MESSAGE };
 
 GST_DEBUG_CATEGORY_STATIC(gst_dxmsgbroker_debug_category);
 #define GST_CAT_DEFAULT gst_dxmsgbroker_debug_category
@@ -77,6 +79,34 @@ static void gst_dxmsgbroker_class_init(GstDxMsgBrokerClass *klass) {
         g_param_spec_string("topic", "Topic",
                             "The topic name for publishing messages. Required.",
                             nullptr, G_PARAM_READWRITE));
+
+    /* Read-only drop accounting, the shape videorate uses for its `drop` and
+     * `duplicate` counters.  These are the only way to tell "the broker lost
+     * it" from "nothing was produced" -- render() returns GST_FLOW_OK in both
+     * cases, so neither the pipeline nor the application sees a difference. */
+    g_object_class_install_property(
+        gobject_class, static_cast<guint>(PropertyID::PROP_MESSAGES_PUBLISHED),
+        g_param_spec_uint64("messages-published", "Messages published",
+                            "Number of messages successfully handed to the broker",
+                            0, G_MAXUINT64, 0,
+                            (GParamFlags)(G_PARAM_READABLE | G_PARAM_STATIC_STRINGS)));
+
+    g_object_class_install_property(
+        gobject_class, static_cast<guint>(PropertyID::PROP_PUBLISH_FAILURES),
+        g_param_spec_uint64("publish-failures", "Publish failures",
+                            "Number of messages lost because the broker was "
+                            "disconnected or rejected them",
+                            0, G_MAXUINT64, 0,
+                            (GParamFlags)(G_PARAM_READABLE | G_PARAM_STATIC_STRINGS)));
+
+    g_object_class_install_property(
+        gobject_class,
+        static_cast<guint>(PropertyID::PROP_BUFFERS_WITHOUT_MESSAGE),
+        g_param_spec_uint64("buffers-without-message", "Buffers without message",
+                            "Number of buffers that reached the sink carrying no "
+                            "message meta (expected when message-interval > 1)",
+                            0, G_MAXUINT64, 0,
+                            (GParamFlags)(G_PARAM_READABLE | G_PARAM_STATIC_STRINGS)));
 
     gst_element_class_add_pad_template(
         GST_ELEMENT_CLASS(klass),
@@ -159,6 +189,15 @@ static void gst_dxmsgbroker_get_property(GObject *object, guint prop_id,
         break;
     case PropertyID::PROP_CONN_INFO:
         g_value_set_string(value, self->_conn_info);
+        break;
+    case PropertyID::PROP_MESSAGES_PUBLISHED:
+        g_value_set_uint64(value, self->_messages_published);
+        break;
+    case PropertyID::PROP_PUBLISH_FAILURES:
+        g_value_set_uint64(value, self->_publish_failures);
+        break;
+    case PropertyID::PROP_BUFFERS_WITHOUT_MESSAGE:
+        g_value_set_uint64(value, self->_buffers_without_message);
         break;
     case PropertyID::PROP_CONFIG:
         g_value_set_string(value, self->_config);
@@ -272,6 +311,7 @@ static GstFlowReturn gst_dxmsgbroker_render(GstBaseSink *sink,
 
     if (!self->_handle) {
         self->_consecutive_failures++;
+        self->_publish_failures++;
         GST_WARNING_OBJECT(self,
             "Broker not connected, dropping message (%u/%u consecutive failures)",
             self->_consecutive_failures, MAX_CONSECUTIVE_FAILURES);
@@ -287,30 +327,47 @@ static GstFlowReturn gst_dxmsgbroker_render(GstBaseSink *sink,
     GstDxMsgMeta *meta =
         (GstDxMsgMeta *)gst_buffer_get_meta(buffer, GST_DXMSG_META_API_TYPE);
 
-    if (meta) {
-        const char *topic = self->_topic;
-        const auto *payload = (DxMsgPayload *)meta->_payload;
-
-        GST_LOG_OBJECT(self, "Publishing message (%u bytes) to topic: %s",
-                         payload->_size, topic);
-        DxMsg_Bal_Error_t error = self->_send_function(self->_handle, topic,
-                                     payload->_key,
-                                     payload->_data, payload->_size);
-        if (error != DxMsg_Bal_Error::DXMSG_BAL_OK) {
-            self->_consecutive_failures++;
-            GST_WARNING_OBJECT(self,
-                "Failed to publish message (%u/%u consecutive failures)",
-                self->_consecutive_failures, MAX_CONSECUTIVE_FAILURES);
-            if (self->_consecutive_failures >= MAX_CONSECUTIVE_FAILURES) {
-                GST_ELEMENT_ERROR(self, RESOURCE, WRITE,
-                    ("Broker publish failed %u consecutive times",
-                     self->_consecutive_failures), (NULL));
-                return GST_FLOW_ERROR;
-            }
-            return GST_FLOW_OK;
-        }
+    if (!meta) {
+        /* No message on this buffer.  With message-interval > 1 that is the
+         * normal case for most buffers, so this cannot warn per buffer -- but
+         * it must not be invisible either, and it must NOT reset
+         * _consecutive_failures: doing so lets a buffer that was never going
+         * to be published clear the evidence of a broker that is failing, so
+         * the MAX_CONSECUTIVE_FAILURES error can never be reached while the
+         * two interleave. */
+        self->_buffers_without_message++;
+        GST_LOG_OBJECT(self, "Buffer carries no message meta (total %"
+                       G_GUINT64_FORMAT ")", self->_buffers_without_message);
+        return GST_FLOW_OK;
     }
 
+    const char *topic = self->_topic;
+    const auto *payload = (DxMsgPayload *)meta->_payload;
+
+    GST_LOG_OBJECT(self, "Publishing message (%u bytes) to topic: %s",
+                     payload->_size, topic);
+    DxMsg_Bal_Error_t error = self->_send_function(self->_handle, topic,
+                                 payload->_key,
+                                 payload->_data, payload->_size);
+    if (error != DxMsg_Bal_Error::DXMSG_BAL_OK) {
+        self->_consecutive_failures++;
+        self->_publish_failures++;
+        GST_WARNING_OBJECT(self,
+            "Failed to publish message (%u/%u consecutive failures, %"
+            G_GUINT64_FORMAT " total)",
+            self->_consecutive_failures, MAX_CONSECUTIVE_FAILURES,
+            self->_publish_failures);
+        if (self->_consecutive_failures >= MAX_CONSECUTIVE_FAILURES) {
+            GST_ELEMENT_ERROR(self, RESOURCE, WRITE,
+                ("Broker publish failed %u consecutive times",
+                 self->_consecutive_failures), (NULL));
+            return GST_FLOW_ERROR;
+        }
+        return GST_FLOW_OK;
+    }
+
+    /* Reset only on an actual publish -- see the !meta branch above. */
+    self->_messages_published++;
     self->_consecutive_failures = 0;
     return GST_FLOW_OK;
 }

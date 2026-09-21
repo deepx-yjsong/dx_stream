@@ -15,6 +15,10 @@ enum class PropertyID {
     PROP_CONFIG_PATH,
     PROP_USE_ORT,
     PROP_BACKEND,
+    PROP_DROPPED_QOS,
+    PROP_DROPPED_THROTTLED,
+    PROP_DROPPED_NO_META,
+    PROP_DROPPED_AFTER_EOS,
     N_PROPERTIES
 };
 
@@ -181,6 +185,18 @@ static void gst_dxinfer_get_property(GObject *object, guint property_id,
                                      GValue *value, GParamSpec *pspec) {
     auto self = GST_DXINFER(object);
     switch (static_cast<PropertyID>(property_id)) {
+    case PropertyID::PROP_DROPPED_QOS:
+        g_value_set_uint64(value, self->_drops.qos.load(std::memory_order_relaxed));
+        break;
+    case PropertyID::PROP_DROPPED_THROTTLED:
+        g_value_set_uint64(value, self->_drops.throttled.load(std::memory_order_relaxed));
+        break;
+    case PropertyID::PROP_DROPPED_NO_META:
+        g_value_set_uint64(value, self->_drops.no_meta.load(std::memory_order_relaxed));
+        break;
+    case PropertyID::PROP_DROPPED_AFTER_EOS:
+        g_value_set_uint64(value, self->_drops.after_eos.load(std::memory_order_relaxed));
+        break;
     case PropertyID::PROP_MODEL_PATH:
         g_value_set_string(value, self->_model_path);
         break;
@@ -432,6 +448,26 @@ static void gst_dxinfer_class_init(GstDxInferClass *klass) {
         GST_TYPE_DXINFER_BACKEND, static_cast<int>(BackendType::AUTO),
         G_PARAM_READWRITE);
 
+    /* Read-only drop counters, one per reason (GstDxInferDropCounters).
+     * chain() returns GST_FLOW_OK for all four, so these are the only way to
+     * tell a frame dropped by design from a frame lost to a fault.  Same shape
+     * as videorate's read-only `drop`/`duplicate`. */
+    const struct { PropertyID id; const char *name; const char *blurb; } drop_props[] = {
+        { PropertyID::PROP_DROPPED_QOS, "dropped-qos",
+          "Buffers dropped for being behind the QoS deadline" },
+        { PropertyID::PROP_DROPPED_THROTTLED, "dropped-throttled",
+          "Buffers dropped to hold the configured inference rate" },
+        { PropertyID::PROP_DROPPED_NO_META, "dropped-no-meta",
+          "Buffers dropped for arriving without DXFrameMeta" },
+        { PropertyID::PROP_DROPPED_AFTER_EOS, "dropped-after-eos",
+          "Buffers dropped because their stream_id is latched by a per-stream EOS" },
+    };
+    for (const auto &dp : drop_props) {
+        obj_properties[static_cast<int>(dp.id)] = g_param_spec_uint64(
+            dp.name, dp.name, dp.blurb, 0, G_MAXUINT64, 0,
+            (GParamFlags)(G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
+    }
+
     g_object_class_install_properties(gobject_class, static_cast<int>(PropertyID::N_PROPERTIES),
                                       obj_properties.data());
 
@@ -470,12 +506,42 @@ gboolean handle_custom_downstream_event(GstDxInfer *self, GstEvent *event) {
             GST_DEBUG_OBJECT(self, "EOS Arrived From Stream [%d]", stream_id);
 
             if (!self->_secondary_mode) {
+                /* Bounded wait.  The predicate can only become true if the NPU
+                 * keeps completing work, and the one moment a stream is removed
+                 * is a moment where that is not guaranteed -- a wedged device
+                 * would pin this streaming thread forever, with no error and no
+                 * log.  The removal deadline lives outside this process (the
+                 * edge daemon gives teardown 10s) and cannot release a thread
+                 * blocked in here, so the bound has to be here too.
+                 *
+                 * On expiry we go on and forward EOS anyway: the buffers still
+                 * queued belong to a stream that is going away, and holding the
+                 * pipeline for them helps no one.  We say so at WARNING -- this
+                 * is the NPU failing to drain, not a routine event.
+                 *
+                 * Reads the map with find() rather than operator[], which would
+                 * insert an entry for a stream that has none. */
+                using namespace std::chrono_literals;
                 std::unique_lock<std::mutex> lock(self->_push_ctx.push_lock);
-                self->_push_ctx.cv.wait(lock, [self, stream_id] {
+                const bool drained = self->_push_ctx.cv.wait_for(
+                    lock, DX_EOS_DRAIN_TIMEOUT, [self, stream_id] {
+                        std::lock_guard<std::mutex> eos_lk(self->_eos_ctx.eos_lock);
+                        auto it = self->_eos_ctx.stream_pending_buffers.find(stream_id);
+                        return it == self->_eos_ctx.stream_pending_buffers.end() ||
+                               it->second <= 0 || !self->_push_ctx.push_running;
+                    });
+                if (!drained) {
                     std::lock_guard<std::mutex> eos_lk(self->_eos_ctx.eos_lock);
-                    return self->_eos_ctx.stream_pending_buffers[stream_id] <= 0 ||
-                           !self->_push_ctx.push_running;
-                });
+                    auto it = self->_eos_ctx.stream_pending_buffers.find(stream_id);
+                    const int left =
+                        it == self->_eos_ctx.stream_pending_buffers.end() ? 0 : it->second;
+                    GST_WARNING_OBJECT(self,
+                        "Stream [%d]: %d buffer(s) still in flight after %llds "
+                        "waiting for the NPU to drain; forwarding EOS anyway",
+                        stream_id, left,
+                        (long long)std::chrono::duration_cast<std::chrono::seconds>(
+                            DX_EOS_DRAIN_TIMEOUT).count());
+                }
             }
 
             if (self->_push_ctx.push_running || self->_secondary_mode) {
@@ -502,6 +568,13 @@ gboolean handle_custom_downstream_event(GstDxInfer *self, GstEvent *event) {
             {
                 std::lock_guard<std::mutex> lock(self->_eos_ctx.eos_lock);
                 self->_eos_ctx.stream_eos_arrived.erase(stream_id);
+                /* The sibling map needs the same eviction and did not get it.
+                 * It is read as stream_pending_buffers[stream_id] in the drain
+                 * predicate below, and std::map::operator[] *inserts* on a
+                 * miss -- so every stream that ever drained leaves an entry
+                 * behind, and a reused stream_id starts its drain against the
+                 * previous source's count. */
+                self->_eos_ctx.stream_pending_buffers.erase(stream_id);
             }
         } else {
             res = gst_pad_push_event(self->_srcpad, event);
@@ -1023,11 +1096,13 @@ static GstFlowReturn gst_dxinfer_chain(GstPad *pad, GstObject *parent,
                    GST_TIME_ARGS(GST_BUFFER_PTS(buf)));
 
     if (should_drop_buffer_due_to_qos(self, buf)) {
+        self->_drops.qos.fetch_add(1, std::memory_order_relaxed);
         gst_buffer_unref(buf);
         return GST_FLOW_OK;
     }
 
     if (should_drop_buffer_due_to_throttling(self, buf)) {
+        self->_drops.throttled.fetch_add(1, std::memory_order_relaxed);
         gst_buffer_unref(buf);
         return GST_FLOW_OK;
     }
@@ -1035,6 +1110,7 @@ static GstFlowReturn gst_dxinfer_chain(GstPad *pad, GstObject *parent,
     auto *frame_meta = dx_get_frame_meta(buf);
 
     if (!frame_meta) {
+        self->_drops.no_meta.fetch_add(1, std::memory_order_relaxed);
         GST_LOG_OBJECT(self, "No DXFrameMeta, dropping buffer");
         gst_buffer_unref(buf);
         return GST_FLOW_OK;
@@ -1043,6 +1119,7 @@ static GstFlowReturn gst_dxinfer_chain(GstPad *pad, GstObject *parent,
     { // NOSONAR - scope for lock
         std::unique_lock<std::mutex> lock(self->_eos_ctx.eos_lock);
         if (self->_eos_ctx.stream_eos_arrived.count(frame_meta->_stream_id) > 0) {
+            self->_drops.after_eos.fetch_add(1, std::memory_order_relaxed);
             GST_INFO_OBJECT(self, "EOS Already Arrived [%d] ", frame_meta->_stream_id);
             gst_buffer_unref(buf);
             return GST_FLOW_OK;

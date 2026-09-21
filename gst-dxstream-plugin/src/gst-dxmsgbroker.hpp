@@ -56,6 +56,16 @@ struct _GstDxMsgBroker {
     guint64 _msgbroker_count;
 
     guint _consecutive_failures;
+
+    /* Drop accounting.  Without these a dropped message is indistinguishable
+     * from one that was never produced: render() returns GST_FLOW_OK either
+     * way, so nothing upstream and nothing in the application can tell.
+     * Three separate counters because the three cases mean different things:
+     * a publish failure is a fault, a buffer without a message is the normal
+     * result of message-interval > 1. */
+    guint64 _messages_published;
+    guint64 _publish_failures;
+    guint64 _buffers_without_message;
 };
 
 G_END_DECLS
