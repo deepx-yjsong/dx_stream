@@ -1,0 +1,187 @@
+From 6d157783276107b8fd129e76b0455e8fad881be9 Mon Sep 17 00:00:00 2001
+From: deepx-yjsong <yjsong@deepx.ai>
+Date: Mon, 28 Sep 2026 16:07:43 +0900
+Subject: [PATCH 2/3] test(inputselector): pin the live deadline contract
+
+- live, one pad silent: the other pad's buffers come out (before: 0 of 30)
+- live, no data: the srcpad task sleeps (a srcpad-segment deadline spins it)
+- non-live, one pad silent: still waits, as before
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ .../test_dxinputselector_live_deadline.cpp    | 163 ++++++++++++++++++
+ 1 file changed, 163 insertions(+)
+ create mode 100644 test/base/element/multistream/test_dxinputselector_live_deadline.cpp
+
+diff --git a/test/base/element/multistream/test_dxinputselector_live_deadline.cpp b/test/base/element/multistream/test_dxinputselector_live_deadline.cpp
+new file mode 100644
+index 0000000..38c0781
+--- /dev/null
++++ b/test/base/element/multistream/test_dxinputselector_live_deadline.cpp
+@@ -0,0 +1,163 @@
++// dxinputselector — live deadline (GstAggregator timeout contract)
++//   live:     a silent pad does not stall the others
++//   live:     with no data the srcpad task sleeps, not spins
++//   non-live: unchanged, a silent pad still blocks
++
++#include <gst/check/gstcheck.h>
++#include <gst/gst.h>
++#include <gst/app/gstappsrc.h>
++#include <gst/app/gstappsink.h>
++
++#include <sys/resource.h>
++#include <cstdio>
++#include <cstring>
++
++static const char *CAPS_RGB_4 =
++    "video/x-raw,format=RGB,width=4,height=4,framerate=30/1";
++
++struct LivePipe {
++    GstElement *pipe, *agg, *sink;
++    GstElement *src[2];
++};
++
++static LivePipe make_pipe(gboolean live) {
++    LivePipe p = {};
++    p.pipe = gst_pipeline_new(nullptr);
++    p.agg = gst_element_factory_make("dxinputselector", "agg");
++    p.sink = gst_element_factory_make("appsink", "sink");
++    fail_unless(p.agg && p.sink);
++    // Short explicit tolerance, independent of the default.
++    g_object_set(p.agg, "latency", (guint64)(50 * GST_MSECOND), nullptr);
++    g_object_set(p.sink, "sync", FALSE, "async", FALSE, nullptr);
++    gst_bin_add_many(GST_BIN(p.pipe), p.agg, p.sink, nullptr);
++    fail_unless(gst_element_link(p.agg, p.sink));
++
++    GstCaps *caps = gst_caps_from_string(CAPS_RGB_4);
++    for (int i = 0; i < 2; i++) {
++        char name[32];
++        snprintf(name, sizeof(name), "src%d", i);
++        p.src[i] = gst_element_factory_make("appsrc", name);
++        g_object_set(p.src[i], "format", GST_FORMAT_TIME, "is-live", live,
++                     "do-timestamp", live, "caps", caps, nullptr);
++        if (live)
++            g_object_set(p.src[i], "min-latency", (gint64)0, nullptr);
++        gst_bin_add(GST_BIN(p.pipe), p.src[i]);
++
++        snprintf(name, sizeof(name), "sink_%d", i);
++        GstPad *req = gst_element_request_pad_simple(p.agg, name);
++        fail_unless(req != nullptr);
++        GstPad *srcpad = gst_element_get_static_pad(p.src[i], "src");
++        fail_unless(gst_pad_link(srcpad, req) == GST_PAD_LINK_OK);
++        gst_object_unref(srcpad);
++        gst_object_unref(req);
++    }
++    gst_caps_unref(caps);
++    return p;
++}
++
++static GstBuffer *make_buf(GstClockTime pts) {
++    gsize sz = 4 * 4 * 3;
++    GstBuffer *b = gst_buffer_new_allocate(nullptr, sz, nullptr);
++    gst_buffer_memset(b, 0, 0x80, sz);
++    GST_BUFFER_PTS(b) = pts;  // NONE for live: appsrc do-timestamp stamps it
++    GST_BUFFER_DURATION(b) = GST_SECOND / 30;
++    return b;
++}
++
++static int drain(GstElement *sink, GstClockTime wait) {
++    int n = 0;
++    GstSample *s;
++    while ((s = gst_app_sink_try_pull_sample(GST_APP_SINK(sink), wait))) {
++        gst_sample_unref(s);
++        n++;
++    }
++    return n;
++}
++
++static double cpu_seconds() {
++    struct rusage ru;
++    getrusage(RUSAGE_SELF, &ru);
++    return ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6 +
++           ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6;
++}
++
++GST_START_TEST(live_silent_pad_does_not_stall_others) {
++    LivePipe p = make_pipe(TRUE);
++    gst_element_set_state(p.pipe, GST_STATE_PLAYING);
++
++    const int pushed = 30;
++    for (int i = 0; i < pushed; i++) {
++        gst_app_src_push_buffer(GST_APP_SRC(p.src[0]),
++                                make_buf(GST_CLOCK_TIME_NONE));
++        g_usleep(G_USEC_PER_SEC / 30);
++    }
++    int got = drain(p.sink, 500 * GST_MSECOND);
++
++    // Allow a couple still in flight.
++    fail_unless(got >= pushed - 2,
++                "live pad stalled by a silent pad: %d of %d buffers out",
++                got, pushed);
++
++    gst_element_set_state(p.pipe, GST_STATE_NULL);
++    gst_object_unref(p.pipe);
++}
++GST_END_TEST;
++
++// A deadline stuck in the past would spin the srcpad task at 100% CPU.
++GST_START_TEST(live_no_data_does_not_spin) {
++    LivePipe p = make_pipe(TRUE);
++    gst_element_set_state(p.pipe, GST_STATE_PLAYING);
++    gst_app_src_push_buffer(GST_APP_SRC(p.src[0]),
++                            make_buf(GST_CLOCK_TIME_NONE));
++    drain(p.sink, 500 * GST_MSECOND);
++
++    const double idle = 1.0;
++    double before = cpu_seconds();
++    g_usleep((gulong)(idle * G_USEC_PER_SEC));
++    double used = cpu_seconds() - before;
++
++    // Spinning burns ~1.0 s per 1 s; 0.3 s leaves room for a loaded machine.
++    fail_unless(used < 0.3 * idle,
++                "srcpad task spins with no data: %.2f s CPU over %.1f s idle",
++                used, idle);
++
++    gst_element_set_state(p.pipe, GST_STATE_NULL);
++    gst_object_unref(p.pipe);
++}
++GST_END_TEST;
++
++// Non-live: no deadline, strict PTS order, waits as before.
++GST_START_TEST(non_live_silent_pad_still_blocks) {
++    LivePipe p = make_pipe(FALSE);
++    gst_element_set_state(p.pipe, GST_STATE_PLAYING);
++
++    for (int i = 0; i < 5; i++)
++        gst_app_src_push_buffer(GST_APP_SRC(p.src[0]),
++                                make_buf(i * GST_SECOND / 30));
++    int got = drain(p.sink, 500 * GST_MSECOND);
++    fail_unless(got == 0,
++                "non-live pipeline must not skip a pad (got %d buffers)", got);
++
++    // Once the silent pad ends, the waiting buffers flow in PTS order.
++    gst_app_src_end_of_stream(GST_APP_SRC(p.src[1]));
++    got = drain(p.sink, 500 * GST_MSECOND);
++    fail_unless(got == 5, "expected 5 buffers after the other pad ended, got %d",
++                got);
++
++    gst_element_set_state(p.pipe, GST_STATE_NULL);
++    gst_object_unref(p.pipe);
++}
++GST_END_TEST;
++
++static Suite *dxinputselector_live_deadline_suite(void) {
++    Suite *s = suite_create("dxinputselector_live_deadline");
++    TCase *tc = tcase_create("contract");
++    tcase_set_timeout(tc, 30.0);
++    suite_add_tcase(s, tc);
++    tcase_add_test(tc, live_silent_pad_does_not_stall_others);
++    tcase_add_test(tc, live_no_data_does_not_spin);
++    tcase_add_test(tc, non_live_silent_pad_still_blocks);
++    return s;
++}
++
++GST_CHECK_MAIN(dxinputselector_live_deadline);
+-- 
+2.43.0
+

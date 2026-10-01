@@ -1,0 +1,69 @@
+From 81b1a78f9e7cca011c24eeec5a99e18be664ba1b Mon Sep 17 00:00:00 2001
+From: deepx-yjsong <yjsong@deepx.ai>
+Date: Tue, 29 Sep 2026 11:31:36 +0900
+Subject: [PATCH 2/3] docs(msgconv,inputselector): document source identity,
+ capture time and payload-type
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ docs/source/docs/Elements/03_07_DxInputSelector.md |  6 ++++++
+ docs/source/docs/Elements/03_10_DxMsgConv.md       | 12 ++++++++++++
+ 2 files changed, 18 insertions(+)
+
+diff --git a/docs/source/docs/Elements/03_07_DxInputSelector.md b/docs/source/docs/Elements/03_07_DxInputSelector.md
+index cea6e8f..833676d 100644
+--- a/docs/source/docs/Elements/03_07_DxInputSelector.md
++++ b/docs/source/docs/Elements/03_07_DxInputSelector.md
+@@ -37,6 +37,12 @@ GObject
+ |---|---|
+ | Format | `video/x-raw` |
+ 
++Sink pad properties:
++
++| **Name** | **Description** | **Type** | **Default Value** |
++|---|---|---|---|
++| `sensor-id` | Identity of the source on this pad, set on its frames as `DXFrameMeta._sensor_id`. The pad index (`stream_id`) is reused by the next source on a re-requested pad; this is not. Can be changed while `PLAYING`; set it before linking so the first frame carries it. | String | `null` |
++
+ **Src (output, always pad `src`)**
+ 
+ | **Property** | **Value** |
+diff --git a/docs/source/docs/Elements/03_10_DxMsgConv.md b/docs/source/docs/Elements/03_10_DxMsgConv.md
+index 5aab882..e44606c 100644
+--- a/docs/source/docs/Elements/03_10_DxMsgConv.md
++++ b/docs/source/docs/Elements/03_10_DxMsgConv.md
+@@ -32,6 +32,10 @@ The element processes metadata through the custom library to generate message pa
+   "seqId": 123,
+   "width": 1920,
+   "height": 1080,
++  "sensorId": "cam01",
++  "nodeId": "node-01",
++  "ptsNs": 1234567890,
++  "captureTime": "2026-09-29T01:02:03.456789012Z",
+   "objects": [
+     {
+       "object": {
+@@ -54,6 +58,10 @@ The element processes metadata through the custom library to generate message pa
+ 
+     The actual message format depends entirely on the implementation of your custom library. The above is just an example from the provided default library. For detailed implementation guidance and complete JSON structure examples, refer to **Chapter 4. Writing Your Own Application**.
+ 
++    `sensorId`, `nodeId`, `ptsNs` and `captureTime` are omitted when unset. `captureTime` is the UTC capture time (RFC 3339) taken from the buffer's `timestamp/x-unix` or `timestamp/x-ntp` reference (for `rtspsrc`, enable `add-reference-timestamp-meta`); other references are ignored.
++
++    With `payload-type=protobuf` the default library emits `dxstream.SensorFrame` (`dx_msgconvl/proto/dx_frame.proto`) with the same fields; `capture_time` is a `google.protobuf.Timestamp`.
++
+     In the default library, frame-level segmentation remains a full-frame semantic class map, while object-level `segment` payloads are ROI-local binary masks aligned to the corresponding `object.box`.
+ 
+ ### **Hierarchy**
+@@ -94,6 +102,10 @@ Custom message-converter libraries must follow the error reporting contract desc
+ | `library-file-path` | Path to the custom message converter library. **Required**.       | String    | `null`           |
+ | `message-interval` | Frame interval at which message is converted.                      | Integer    | `1`             |
+ | `include-frame`  | Flag whether to include frame data as base64 JPEG in the message. (optional). | Boolean   | `false`          |
++| `node-id`        | Identifier of this node, emitted in each message. (optional). | String | `null` |
++| `payload-type`   | Serialization format the custom library should emit: `json` or `protobuf`. The protobuf backend of the default library is built only when libprotobuf and protoc are found. | Enum | `json` |
++
++Each message also carries a broker key: the source's `sensor-id` (see **DxInputSelector**), or none if unset. **DxMsgBroker** with Kafka sends it as the message key, so one source's messages stay in order on one partition.
+ 
+ !!! warning "Limitation"
+ 
+-- 
+2.43.0
+

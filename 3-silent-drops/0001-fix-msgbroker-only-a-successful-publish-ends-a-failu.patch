@@ -1,0 +1,154 @@
+From b6a39e36605bb5f86c92ac2a0e29a98b7e9cfbcd Mon Sep 17 00:00:00 2001
+From: deepx-yjsong <yjsong@deepx.ai>
+Date: Mon, 28 Sep 2026 16:21:49 +0900
+Subject: [PATCH 1/3] fix(msgbroker): only a successful publish ends a failure
+ streak
+
+The consecutive-failure counter was reset on every render(), including
+buffers without DxMsgMeta (e.g. message-interval > 1). Interleaved with
+failing publishes they kept the streak below the limit, so the error never
+fired. Reset only after a successful publish.
+
+Test (stub broker): ten failures interleaved with message-less buffers now
+return GST_FLOW_ERROR on the tenth.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ gst-dxstream-plugin/src/gst-dxmsgbroker.cpp   |   5 +-
+ .../test_dxmsgbroker_failure_streak.cpp       | 106 ++++++++++++++++++
+ 2 files changed, 110 insertions(+), 1 deletion(-)
+ create mode 100644 test/base/element/messaging/test_dxmsgbroker_failure_streak.cpp
+
+diff --git a/gst-dxstream-plugin/src/gst-dxmsgbroker.cpp b/gst-dxstream-plugin/src/gst-dxmsgbroker.cpp
+index 95c5d35..5cd244f 100644
+--- a/gst-dxstream-plugin/src/gst-dxmsgbroker.cpp
++++ b/gst-dxstream-plugin/src/gst-dxmsgbroker.cpp
+@@ -308,9 +308,12 @@ static GstFlowReturn gst_dxmsgbroker_render(GstBaseSink *sink,
+             }
+             return GST_FLOW_OK;
+         }
++        /* Only a successful publish ends a failure streak. */
++        self->_consecutive_failures = 0;
++    } else {
++        GST_LOG_OBJECT(self, "No DxMsgMeta on buffer, nothing to publish");
+     }
+ 
+-    self->_consecutive_failures = 0;
+     return GST_FLOW_OK;
+ }
+ 
+diff --git a/test/base/element/messaging/test_dxmsgbroker_failure_streak.cpp b/test/base/element/messaging/test_dxmsgbroker_failure_streak.cpp
+new file mode 100644
+index 0000000..3578a7f
+--- /dev/null
++++ b/test/base/element/messaging/test_dxmsgbroker_failure_streak.cpp
+@@ -0,0 +1,106 @@
++// dxmsgbroker — only a successful publish ends a failure streak
++// Message-less buffers (message-interval > 1) must not reset it.
++// White-box: stub broker handle and send function.
++
++#include <gst/check/gstcheck.h>
++#include <gst/gst.h>
++#include "gst-dxmsgbroker.hpp"
++#include "gst-dxmsgmeta.hpp"
++
++static int g_sends = 0;
++static bool g_fail = true;
++
++static DxMsg_Bal_Error_t stub_send(DxMsg_Bal_Handle_t, const char *,
++                                   const void *, int) {
++    g_sends++;
++    return g_fail ? DxMsg_Bal_Error::DXMSG_BAL_ERR_BROKER
++                  : DxMsg_Bal_Error::DXMSG_BAL_OK;
++}
++
++struct BrokerUnderTest {
++    GstDxMsgBroker *broker;
++
++    static BrokerUnderTest make() {
++        BrokerUnderTest t;
++        t.broker = GST_DXMSGBROKER(gst_element_factory_make("dxmsgbroker", nullptr));
++        fail_unless(t.broker != nullptr);
++        // Fake connection; the stub never dereferences it.
++        t.broker->_handle = reinterpret_cast<DxMsg_Bal_Handle_t>(0x1);
++        t.broker->_send_function = stub_send;
++        t.broker->_disconnect_function = nullptr;
++        g_sends = 0;
++        return t;
++    }
++
++    GstFlowReturn render(GstBuffer *buf) {
++        GstBaseSinkClass *k = GST_BASE_SINK_GET_CLASS(broker);
++        GstFlowReturn ret = k->render(GST_BASE_SINK(broker), buf);
++        gst_buffer_unref(buf);
++        return ret;
++    }
++
++    GstFlowReturn render_message() {
++        GstBuffer *buf = gst_buffer_new();
++        static char data[] = "{}";
++        DxMsgPayload payload = {data, (guint)sizeof(data) - 1};
++        dx_add_payload_to_buffer(buf, &payload);
++        return render(buf);
++    }
++
++    GstFlowReturn render_no_message() { return render(gst_buffer_new()); }
++
++    void destroy() {
++        broker->_handle = nullptr;  // not a real handle; nothing to disconnect
++        gst_object_unref(broker);
++    }
++};
++
++// Every other buffer has no message (as with message-interval=2).
++GST_START_TEST(message_less_buffers_do_not_end_the_streak) {
++    auto t = BrokerUnderTest::make();
++    g_fail = true;
++
++    GstFlowReturn last = GST_FLOW_OK;
++    for (int i = 0; i < 10; i++) {
++        last = t.render_message();
++        if (last != GST_FLOW_OK) break;
++        fail_unless_equals_int(t.render_no_message(), GST_FLOW_OK);
++    }
++
++    fail_unless_equals_int(g_sends, 10);
++    fail_unless(last == GST_FLOW_ERROR,
++                "10 consecutive publish failures, interleaved with message-less "
++                "buffers, did not raise an error (flow %s)",
++                gst_flow_get_name(last));
++    t.destroy();
++}
++GST_END_TEST;
++
++// A publish that goes through does end the streak.
++GST_START_TEST(successful_publish_ends_the_streak) {
++    auto t = BrokerUnderTest::make();
++
++    g_fail = true;
++    for (int i = 0; i < 9; i++)
++        fail_unless_equals_int(t.render_message(), GST_FLOW_OK);
++    g_fail = false;
++    fail_unless_equals_int(t.render_message(), GST_FLOW_OK);
++    g_fail = true;
++    for (int i = 0; i < 9; i++)
++        fail_unless_equals_int(t.render_message(), GST_FLOW_OK);
++
++    t.destroy();
++}
++GST_END_TEST;
++
++static Suite *dxmsgbroker_failure_streak_suite(void) {
++    Suite *s = suite_create("dxmsgbroker_failure_streak");
++    TCase *tc = tcase_create("contract");
++    tcase_set_timeout(tc, 30.0);
++    suite_add_tcase(s, tc);
++    tcase_add_test(tc, message_less_buffers_do_not_end_the_streak);
++    tcase_add_test(tc, successful_publish_ends_the_streak);
++    return s;
++}
++
++GST_CHECK_MAIN(dxmsgbroker_failure_streak);
+-- 
+2.43.0
+

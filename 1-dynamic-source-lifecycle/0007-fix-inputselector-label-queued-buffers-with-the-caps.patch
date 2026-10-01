@@ -1,0 +1,223 @@
+From 996d44ab117e81b5fab8356dde372aab03c06c4e Mon Sep 17 00:00:00 2001
+From: deepx-yjsong <yjsong@deepx.ai>
+Date: Wed, 30 Sep 2026 11:03:46 +0900
+Subject: [PATCH 07/10] fix(inputselector): label queued buffers with the caps
+ they were sent with
+
+clip() stamped DXFrameMeta's size and format from gst_pad_get_current_caps().
+GstAggregator clips lazily, when a buffer is about to be consumed, and the
+pad's current caps are replaced as soon as a new CAPS event arrives. Buffers
+queued before a resolution change were therefore labelled with the new size;
+a downstream element trusting the label read a small buffer as a large one
+and crashed.
+
+Keep each stream's caps as of the last CAPS event processed in order (events
+are handled only after the buffers queued ahead of them), as
+GstVideoAggregatorPad does, and stamp from those.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ .../src/gst-dxinputselector.cpp               | 53 ++++++++++++++++++-
+ .../src/gst-dxinputselector.hpp               |  6 +++
+ .../multistream/test_dxinputselector.cpp      | 49 +++++++++++++++++
+ 3 files changed, 107 insertions(+), 1 deletion(-)
+
+diff --git a/gst-dxstream-plugin/src/gst-dxinputselector.cpp b/gst-dxstream-plugin/src/gst-dxinputselector.cpp
+index 534936a..e683265 100644
+--- a/gst-dxstream-plugin/src/gst-dxinputselector.cpp
++++ b/gst-dxstream-plugin/src/gst-dxinputselector.cpp
+@@ -66,6 +66,40 @@ static void send_wrapped_eos(GstAggregator *agg, gint stream_id) {
+     gst_pad_push_event(GST_AGGREGATOR_SRC_PAD(agg), wrapped);
+ }
+ 
++static GstCaps *stream_caps(GstDxInputSelector *self, gint stream_id) {
++    GstCaps *caps = nullptr;
++    g_mutex_lock(&self->_stream_caps_lock);
++    auto it = self->_stream_caps.find(stream_id);
++    if (it != self->_stream_caps.end())
++        caps = gst_caps_ref(it->second);
++    g_mutex_unlock(&self->_stream_caps_lock);
++    return caps;
++}
++
++static void set_stream_caps(GstDxInputSelector *self, gint stream_id,
++                            GstCaps *caps) {
++    g_mutex_lock(&self->_stream_caps_lock);
++    auto it = self->_stream_caps.find(stream_id);
++    if (it != self->_stream_caps.end()) {
++        gst_caps_unref(it->second);
++        if (caps)
++            it->second = gst_caps_ref(caps);
++        else
++            self->_stream_caps.erase(it);
++    } else if (caps) {
++        self->_stream_caps[stream_id] = gst_caps_ref(caps);
++    }
++    g_mutex_unlock(&self->_stream_caps_lock);
++}
++
++static void clear_stream_caps(GstDxInputSelector *self) {
++    g_mutex_lock(&self->_stream_caps_lock);
++    for (auto &kv : self->_stream_caps)
++        gst_caps_unref(kv.second);
++    self->_stream_caps.clear();
++    g_mutex_unlock(&self->_stream_caps_lock);
++}
++
+ static GstBuffer *
+ gst_dxinputselector_clip(GstAggregator *agg, GstAggregatorPad *pad,
+                           GstBuffer *buf) {
+@@ -82,8 +116,13 @@ gst_dxinputselector_clip(GstAggregator *agg, GstAggregatorPad *pad,
+                              get_sink_pad_index(GST_PAD(pad)));
+             return buf;
+         }
+-        GstCaps *caps = gst_pad_get_current_caps(GST_PAD(pad));
+         meta->_stream_id = get_sink_pad_index(GST_PAD(pad));
++        /* Not gst_pad_get_current_caps(): clip() runs when a buffer is
++         * consumed, and a newer CAPS may already be stored on the pad while
++         * older buffers are still queued. */
++        GstCaps *caps = stream_caps(GST_DXINPUTSELECTOR(agg), meta->_stream_id);
++        if (!caps)
++            caps = gst_pad_get_current_caps(GST_PAD(pad));
+         if (caps) {
+             const GstStructure *s = gst_caps_get_structure(caps, 0);
+             meta->_name = gst_structure_get_name(s);
+@@ -120,6 +159,11 @@ gst_dxinputselector_sink_event(GstAggregator *agg, GstAggregatorPad *pad,
+         /* fall through */
+     case GST_EVENT_CAPS:
+     case GST_EVENT_SEGMENT:
++        if (GST_EVENT_TYPE(event) == GST_EVENT_CAPS) {
++            GstCaps *caps = nullptr;
++            gst_event_parse_caps(event, &caps);
++            set_stream_caps(GST_DXINPUTSELECTOR(agg), stream_id, caps);
++        }
+         // Aggregator default eats these (B.6). L1A domain events are emitted
+         // by GstAggregator's negotiate (push_mandatory_events) before the
+         // first buffer. Here we only emit the per-stream L2 wrap.
+@@ -231,6 +275,7 @@ static gboolean gst_dxinputselector_start(GstAggregator *agg) {
+ static gboolean gst_dxinputselector_stop(GstAggregator *agg) {
+     GstDxInputSelector *self = GST_DXINPUTSELECTOR(agg);
+     self->_stream_eos_sent.clear();
++    clear_stream_caps(self);
+     return TRUE;
+ }
+ 
+@@ -239,6 +284,7 @@ static void gst_dxinputselector_release_pad(GstElement *element, GstPad *pad) {
+     GstAggregator *agg = GST_AGGREGATOR(element);
+     gint stream_id = get_sink_pad_index(pad);
+     const gboolean running = gst_pad_is_active(GST_AGGREGATOR_SRC_PAD(agg));
++    set_stream_caps(self, stream_id, nullptr);
+ 
+     /* Release first: once the pad is gone aggregate() can no longer mark its
+      * EOS as sent, so the check below cannot race with it. */
+@@ -302,11 +348,16 @@ static void gst_dxinputselector_init(GstDxInputSelector *self) {
+     // Skipping this crashes on MSVC (null tree sentinel) the first time the
+     // set is touched (e.g. _stream_eos_sent.clear() in start()).
+     new (&self->_stream_eos_sent) std::set<int>();
++    new (&self->_stream_caps) std::map<int, GstCaps *>();
++    g_mutex_init(&self->_stream_caps_lock);
+     self->_max_queue_size = 2;
+ }
+ 
+ static void gst_dxinputselector_finalize(GObject *object) {
+     GstDxInputSelector *self = GST_DXINPUTSELECTOR(object);
++    clear_stream_caps(self);
++    self->_stream_caps.~map();
++    g_mutex_clear(&self->_stream_caps_lock);
+     self->_stream_eos_sent.~set();
+     G_OBJECT_CLASS(parent_class)->finalize(object);
+ }
+diff --git a/gst-dxstream-plugin/src/gst-dxinputselector.hpp b/gst-dxstream-plugin/src/gst-dxinputselector.hpp
+index 33dd439..558e559 100644
+--- a/gst-dxstream-plugin/src/gst-dxinputselector.hpp
++++ b/gst-dxstream-plugin/src/gst-dxinputselector.hpp
+@@ -3,6 +3,7 @@
+ 
+ #include <gst/base/gstaggregator.h>
+ #include <gst/gst.h>
++#include <map>
+ #include <set>
+ 
+ G_BEGIN_DECLS
+@@ -14,6 +15,11 @@ G_DECLARE_FINAL_TYPE(GstDxInputSelector, gst_dxinputselector, GST,
+ struct _GstDxInputSelector {
+     GstAggregator parent_instance;
+     std::set<int> _stream_eos_sent;
++    /* Caps of each stream as of the last CAPS event processed in order, i.e.
++     * the caps of the buffers now reaching clip(). Leaf lock: clip() runs
++     * under the pad lock. */
++    std::map<int, GstCaps *> _stream_caps;
++    GMutex _stream_caps_lock;
+     guint _max_queue_size;
+ };
+ 
+diff --git a/test/base/element/multistream/test_dxinputselector.cpp b/test/base/element/multistream/test_dxinputselector.cpp
+index a46f351..bafc798 100644
+--- a/test/base/element/multistream/test_dxinputselector.cpp
++++ b/test/base/element/multistream/test_dxinputselector.cpp
+@@ -387,6 +387,54 @@ GST_START_TEST(CE_inputsel_caps_wrapping) {
+ }
+ GST_END_TEST;
+ 
++// CE_inputsel_caps_change_labels_queued_buffers: buffers queued before a CAPS
++// change keep the old size in DXFrameMeta. GstAggregator clips lazily, when a
++// buffer is consumed, so the pad's current caps may already be the new ones.
++// MUT: read gst_pad_get_current_caps() in clip() → queued old buffer labelled 8x8
++static GstBuffer *make_buf_sized(GstClockTime pts, int w, int h) {
++    gsize sz = (gsize)w * h * 3;
++    GstBuffer *b = gst_buffer_new_allocate(nullptr, sz, nullptr);
++    gst_buffer_memset(b, 0, 0x80, sz);
++    GST_BUFFER_PTS(b) = pts;
++    GST_BUFFER_DURATION(b) = GST_SECOND / 30;
++    return b;
++}
++
++GST_START_TEST(CE_inputsel_caps_change_labels_queued_buffers) {
++    AggPipe p = make_agg_pipe("dxinputselector", 2);
++    p.start();
++    // Pad 1 has no data yet, so pad 0's buffers stay queued.
++    p.push(0, make_buf_sized(100 * GST_MSECOND, 4, 4));
++    p.push(0, make_buf_sized(200 * GST_MSECOND, 4, 4));
++    GstCaps *big = gst_caps_from_string(
++        "video/x-raw,format=RGB,width=8,height=8,framerate=30/1");
++    g_object_set(p.src[0], "caps", big, nullptr);
++    gst_caps_unref(big);
++    p.push(0, make_buf_sized(300 * GST_MSECOND, 8, 8));
++    g_usleep(200 * 1000);
++    p.push(1, make_buf(GST_SECOND));
++    p.push(1, make_buf(2 * GST_SECOND));
++
++    const int want[3] = {4, 4, 8};
++    for (int i = 0; i < 3; i++) {
++        GstSample *s = p.pull();
++        fail_unless(s != nullptr, "output %d must arrive", i);
++        GstBuffer *b = gst_sample_get_buffer(s);
++        DXFrameMeta *fm = dx_get_frame_meta(b);
++        fail_unless(fm != nullptr);
++        fail_unless_equals_int(fm->_stream_id, 0);
++        fail_unless(fm->_width == want[i],
++                    "buffer %d (%zu bytes) labelled %dx%d, expected width %d",
++                    i, gst_buffer_get_size(b), fm->_width, fm->_height, want[i]);
++        fail_unless((gsize)fm->_width * fm->_height * 3 == gst_buffer_get_size(b));
++        gst_sample_unref(s);
++    }
++    p.eos(0);
++    p.eos(1);
++    p.stop();
++}
++GST_END_TEST;
++
+ static Suite *dxinputselector_suite(void) {
+     Suite *s = suite_create("dxinputselector");
+     TCase *tc = tcase_create("contract");
+@@ -402,6 +450,7 @@ static Suite *dxinputselector_suite(void) {
+     tcase_add_test(tc, CE_inputsel_min_pts_order);
+     tcase_add_test(tc, CE_inputsel_per_stream_wrapped_eos);
+     tcase_add_test(tc, CE_inputsel_caps_wrapping);
++    tcase_add_test(tc, CE_inputsel_caps_change_labels_queued_buffers);
+     return s;
+ }
+ 
+-- 
+2.43.0
+

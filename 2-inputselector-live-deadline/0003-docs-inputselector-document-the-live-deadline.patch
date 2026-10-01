@@ -1,0 +1,25 @@
+From 972ae96f5a7bd1805e0956f7f97bb7138d96f033 Mon Sep 17 00:00:00 2001
+From: deepx-yjsong <yjsong@deepx.ai>
+Date: Tue, 29 Sep 2026 11:31:11 +0900
+Subject: [PATCH 3/3] docs(inputselector): document the live deadline
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ docs/source/docs/Elements/03_07_DxInputSelector.md | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/docs/source/docs/Elements/03_07_DxInputSelector.md b/docs/source/docs/Elements/03_07_DxInputSelector.md
+index c4473f0..2bdb917 100644
+--- a/docs/source/docs/Elements/03_07_DxInputSelector.md
++++ b/docs/source/docs/Elements/03_07_DxInputSelector.md
+@@ -8,6 +8,7 @@ It is the entry boundary of the multi-stream domain — its src caps are `applic
+ 
+ - Among N input streams, DxInputSelector selects the buffer with the smallest PTS and forwards it downstream.  
+ - This approach ensures that the output stream maintains temporal consistency across input channels.  
++- With **live** sources, a sink pad that has no buffer by the deadline is left out of that round instead of stalling the others. The deadline is the running time of the earliest queued buffer plus the pipeline latency (the `latency` property of `GstAggregator` adds to it). A source that stops sending therefore does not stop the other streams; strict PTS order across pads is relaxed only for that round. Non-live pipelines keep waiting for every pad.  
+ 
+ 
+ **Event Handling**
+-- 
+2.43.0
+

@@ -1,0 +1,133 @@
+From be3d8f4270c52b26b83e15fdd381971dc54b5f57 Mon Sep 17 00:00:00 2001
+From: deepx-yjsong <yjsong@deepx.ai>
+Date: Wed, 30 Sep 2026 15:37:04 +0900
+Subject: [PATCH 3/3] feat(pydxs): expose DXFrameMeta.sensor_id
+
+sensor_id was added to DXFrameMeta for the source identity, but Python code
+could not read it, so a Python probe could only see the pad index, which is
+handed to the next source when a pad is reused.
+
+Tests: CPY2 reads back a written sensor_id; new CPY7 reads, from Python, the
+sensor_id dxinputselector stamps from its sink pad "sensor-id".
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ .../python/pydxs/src/metadata_binding.cpp     |  3 ++
+ test/base/pydxs/test_pydxs.py                 | 40 ++++++++++++++++++-
+ 2 files changed, 42 insertions(+), 1 deletion(-)
+
+diff --git a/bindings/python/pydxs/src/metadata_binding.cpp b/bindings/python/pydxs/src/metadata_binding.cpp
+index c00b6db..db31462 100644
+--- a/bindings/python/pydxs/src/metadata_binding.cpp
++++ b/bindings/python/pydxs/src/metadata_binding.cpp
+@@ -399,6 +399,9 @@ PYBIND11_MODULE(pydxs, m) {
+     )pbdoc")
+         // Simple read/write attributes
+         .def_readwrite("stream_id", &DXFrameMeta::_stream_id, "Stream identifier")
++        .def_readwrite("sensor_id", &DXFrameMeta::_sensor_id,
++                       "Identity of the source (dxinputselector pad \"sensor-id\"); "
++                       "empty if unset. Unlike stream_id it is not reused")
+         .def_readwrite("width", &DXFrameMeta::_width, "Frame width in pixels")
+         .def_readwrite("height", &DXFrameMeta::_height, "Frame height in pixels")
+         .def_readwrite("frame_rate", &DXFrameMeta::_frame_rate, "Frame rate (fps)")
+diff --git a/test/base/pydxs/test_pydxs.py b/test/base/pydxs/test_pydxs.py
+index 08b39b0..ae4f44e 100644
+--- a/test/base/pydxs/test_pydxs.py
++++ b/test/base/pydxs/test_pydxs.py
+@@ -7,6 +7,7 @@ CPY2: GstBuffer → DXFrameMeta read access via probe
+ CPY3: DXObjectMeta properties (box, label, track_id)
+ CPY4: numpy conversion for tensors
+ CPY5: writable_buffer context manager + read-only buffer safety
++CPY7: sensor_id stamped by dxinputselector (pad "sensor-id") read via pydxs
+ """
+ 
+ import os
+@@ -93,7 +94,7 @@ def test_cpy1_import():
+ def test_cpy2_frame_meta_read():
+     import pydxs
+ 
+-    probe_results = {'fm_found': False, 'stream_id': None, 'width': None,
++    probe_results = {'fm_found': False, 'stream_id': None, 'sensor_id': None, 'width': None,
+                      'obj_count': 0, 'obj_label': None, 'obj_box': None}
+ 
+     def write_probe(pad, info, _):
+@@ -101,6 +102,7 @@ def test_cpy2_frame_meta_read():
+             if not fm:
+                 return Gst.PadProbeReturn.OK
+             fm.stream_id = 3
++            fm.sensor_id = "cam-03"
+             fm.width = 320
+             fm.height = 240
+             obj = pydxs.dx_acquire_obj_meta_from_pool()
+@@ -118,6 +120,7 @@ def test_cpy2_frame_meta_read():
+         if fm:
+             probe_results['fm_found'] = True
+             probe_results['stream_id'] = fm.stream_id
++            probe_results['sensor_id'] = fm.sensor_id
+             probe_results['width'] = fm.width
+             for obj in fm:
+                 probe_results['obj_count'] += 1
+@@ -146,6 +149,8 @@ def test_cpy2_frame_meta_read():
+     check("CPY2_meta_found", probe_results['fm_found'])
+     check("CPY2_stream_id", probe_results['stream_id'] == 3,
+           f"expected 3, got {probe_results['stream_id']}")
++    check("CPY2_sensor_id", probe_results['sensor_id'] == "cam-03",
++          f"expected 'cam-03', got {probe_results['sensor_id']!r}")
+     check("CPY2_width", probe_results['width'] == 320,
+           f"expected 320, got {probe_results['width']}")
+     check("CPY2_obj_count", probe_results['obj_count'] >= 1,
+@@ -316,6 +321,37 @@ def test_cpy5_writable_buffer():
+           f"got {user_results['data_back']}")
+ 
+ 
++# ---- CPY7: sensor_id stamped by dxinputselector is readable from Python ----
++def test_cpy7_sensor_id_from_selector():
++    import pydxs
++    seen = []
++
++    def read_probe(pad, info, _):
++        buf = info.get_buffer()
++        fm = pydxs.dx_get_frame_meta(hash(buf)) if buf else None
++        if fm:
++            seen.append(fm.sensor_id)
++        return Gst.PadProbeReturn.OK
++
++    pipe = Gst.parse_launch(
++        "dxinputselector name=sel ! fakesink name=sink sync=false async=false "
++        "videotestsrc num-buffers=3 "
++        "! video/x-raw,format=RGB,width=64,height=64,framerate=30/1 ! sel.sink_0")
++    sel = pipe.get_by_name("sel")
++    sel.get_static_pad("sink_0").set_property("sensor-id", "cam-07")
++    pipe.get_by_name("sink").get_static_pad("sink").add_probe(
++        Gst.PadProbeType.BUFFER, read_probe, None)
++
++    pipe.set_state(Gst.State.PLAYING)
++    pipe.get_bus().timed_pop_filtered(10 * Gst.SECOND,
++                                      Gst.MessageType.EOS | Gst.MessageType.ERROR)
++    pipe.set_state(Gst.State.NULL)
++
++    check("CPY7_frames", len(seen) == 3, f"expected 3 frames, got {len(seen)}")
++    check("CPY7_sensor_id", seen and all(s == "cam-07" for s in seen),
++          f"expected 'cam-07' on every frame, got {seen}")
++
++
+ def main():
+     if not HAS_GI:
+         print(f"[INFO] PyGObject (gi) unavailable: {_GI_ERR}")
+@@ -329,11 +365,13 @@ def main():
+         test_cpy4_numpy_tensor()
+         test_cpy6_depth_metadata()
+         test_cpy5_writable_buffer()
++        test_cpy7_sensor_id_from_selector()
+     else:
+         skip("CPY2_frame_meta_read", "requires gi/GStreamer")
+         skip("CPY4_numpy_tensor", "requires gi/GStreamer")
+         skip("CPY6_depth_metadata", "requires gi/GStreamer")
+         skip("CPY5_writable_buffer", "requires gi/GStreamer")
++        skip("CPY7_sensor_id_from_selector", "requires gi/GStreamer")
+ 
+     total = passed + failed
+     print(f"\n{'='*50}")
+-- 
+2.43.0
+

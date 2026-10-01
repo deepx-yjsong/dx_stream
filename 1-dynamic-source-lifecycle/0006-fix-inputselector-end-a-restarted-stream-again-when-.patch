@@ -1,0 +1,116 @@
+From 2b1be96dfaa27c6c1aadc187a575ee39ebf1927e Mon Sep 17 00:00:00 2001
+From: deepx-yjsong <yjsong@deepx.ai>
+Date: Wed, 30 Sep 2026 10:44:12 +0900
+Subject: [PATCH 06/10] fix(inputselector): end a restarted stream again when
+ its pad is released
+
+The selector remembers which streams it has already ended so that releasing
+the pad does not end them twice. That record was never cleared when the
+stream started again on the same pad, while GstAggregator clears the pad's
+EOS on STREAM_START (and on FLUSH_STOP). A source that ended once, restarted
+(e.g. its bin set to NULL and back to PLAYING), and was later released got
+no end-of-stream downstream, so per-stream state in downstream elements
+survived and passed to the next source on that stream id.
+
+Clear the record on STREAM_START and FLUSH_STOP, as the base class does.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ .../src/gst-dxinputselector.cpp               | 16 ++++++++++++-
+ .../test_dxinputselector_release_eos.cpp      | 24 +++++++++++++++++++
+ 2 files changed, 39 insertions(+), 1 deletion(-)
+
+diff --git a/gst-dxstream-plugin/src/gst-dxinputselector.cpp b/gst-dxstream-plugin/src/gst-dxinputselector.cpp
+index 4ad7a32..534936a 100644
+--- a/gst-dxstream-plugin/src/gst-dxinputselector.cpp
++++ b/gst-dxstream-plugin/src/gst-dxinputselector.cpp
+@@ -100,6 +100,13 @@ gst_dxinputselector_clip(GstAggregator *agg, GstAggregatorPad *pad,
+     return buf;
+ }
+ 
++static void forget_stream_eos(GstAggregator *agg, gint stream_id) {
++    GstDxInputSelector *self = GST_DXINPUTSELECTOR(agg);
++    GST_OBJECT_LOCK(self);
++    self->_stream_eos_sent.erase(stream_id);
++    GST_OBJECT_UNLOCK(self);
++}
++
+ static gboolean
+ gst_dxinputselector_sink_event(GstAggregator *agg, GstAggregatorPad *pad,
+                                 GstEvent *event) {
+@@ -107,6 +114,10 @@ gst_dxinputselector_sink_event(GstAggregator *agg, GstAggregatorPad *pad,
+ 
+     switch (GST_EVENT_TYPE(event)) {
+     case GST_EVENT_STREAM_START:
++        /* A new stream on this pad: GstAggregator clears the pad's EOS here,
++         * so its end has to be signalled again. */
++        forget_stream_eos(agg, stream_id);
++        /* fall through */
+     case GST_EVENT_CAPS:
+     case GST_EVENT_SEGMENT:
+         // Aggregator default eats these (B.6). L1A domain events are emitted
+@@ -124,8 +135,11 @@ gst_dxinputselector_sink_event(GstAggregator *agg, GstAggregatorPad *pad,
+         gst_event_unref(event);
+         return TRUE;
+ 
+-    case GST_EVENT_FLUSH_START:
+     case GST_EVENT_FLUSH_STOP:
++        forget_stream_eos(agg, stream_id);  // flushing clears the pad's EOS too
++        return GST_AGGREGATOR_CLASS(parent_class)->sink_event(agg, pad, event);
++
++    case GST_EVENT_FLUSH_START:
+         // L1B: aggregator default handles upstream/downstream broadcast
+         return GST_AGGREGATOR_CLASS(parent_class)->sink_event(agg, pad, event);
+ 
+diff --git a/test/base/element/multistream/test_dxinputselector_release_eos.cpp b/test/base/element/multistream/test_dxinputselector_release_eos.cpp
+index 3368205..6ca9013 100644
+--- a/test/base/element/multistream/test_dxinputselector_release_eos.cpp
++++ b/test/base/element/multistream/test_dxinputselector_release_eos.cpp
+@@ -1,6 +1,7 @@
+ // dxinputselector — releasing a pad ends its stream downstream
+ // Exactly one wrapped per-stream EOS per released pad, whether or not the
+ // source sent EOS first, and none while the element is not running.
++// A stream restarted on the pad (new STREAM_START) must be ended again.
+ 
+ #include <gst/check/gstcheck.h>
+ #include <gst/gst.h>
+@@ -131,6 +132,28 @@ GST_START_TEST(release_after_forwarded_eos_does_not_repeat) {
+ }
+ GST_END_TEST;
+ 
++// The source ended, restarted on the same pad, and is then released: the
++// restarted stream must be ended too, or downstream keeps its state.
++GST_START_TEST(release_after_restart_ends_the_new_stream) {
++    auto t = Sel::make();
++    t.play();
++    fail_unless(gst_pad_send_event(t.s0, gst_event_new_eos()));
++    push(t.s1, GST_SECOND / 30);
++    wait_for(1, 1000);
++    fail_unless_equals_int(g_atomic_int_get(&g_eos0), 1);
++
++    preamble(t.s0, "s0-restarted");
++    push(t.s0, 2 * GST_SECOND / 30);
++    push(t.s1, 2 * GST_SECOND / 30);
++
++    t.release0();
++    wait_for(2, 1000);
++    g_usleep(100 * 1000);
++    fail_unless_equals_int(g_atomic_int_get(&g_eos0), 2);
++    t.destroy();
++}
++GST_END_TEST;
++
+ // Not running (pipeline torn down): nothing to signal.
+ GST_START_TEST(release_while_stopped_sends_nothing) {
+     auto t = Sel::make();
+@@ -148,6 +171,7 @@ static Suite *dxinputselector_release_eos_suite(void) {
+     tcase_add_test(tc, release_without_eos_ends_the_stream);
+     tcase_add_test(tc, eos_then_immediate_release_ends_once);
+     tcase_add_test(tc, release_after_forwarded_eos_does_not_repeat);
++    tcase_add_test(tc, release_after_restart_ends_the_new_stream);
+     tcase_add_test(tc, release_while_stopped_sends_nothing);
+     return s;
+ }
+-- 
+2.43.0
+

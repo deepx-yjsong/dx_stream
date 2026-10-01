@@ -1,0 +1,635 @@
+From 85ece1f728dc420277d949a204f5309f0b868fcb Mon Sep 17 00:00:00 2001
+From: deepx-yjsong <yjsong@deepx.ai>
+Date: Tue, 29 Sep 2026 11:17:33 +0900
+Subject: [PATCH 2/3] feat(infer,msgbroker,inputselector): expose silent drops
+ as a `stats` structure
+
+Each of these elements discards buffers while returning GST_FLOW_OK, so from
+outside a frame dropped by design and a frame lost to a fault look the same.
+
+Each element gets a read-only `stats` property (GstStructure, guint64 fields),
+the convention of identity, rtpjitterbuffer and rtpsession: one read returns a
+consistent snapshot, and a new counter does not change the API.
+
+  dxinfer          application/x-dxinfer-stats
+                   dropped-qos, dropped-throttled, dropped-no-meta,
+                   dropped-after-eos
+  dxmsgbroker      application/x-dxmsgbroker-stats
+                   published, failed, no-message
+  dxinputselector  application/x-dxinputselector-stats
+                   pads-skipped
+
+Counters reset when the element starts.
+
+Tests: test_dxinfer_stats (new), and stats cases in
+test_dxmsgbroker_failure_streak and test_dxinputselector_live_deadline.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ gst-dxstream-plugin/src/gst-dxinfer.cpp       |  28 ++++
+ gst-dxstream-plugin/src/gst-dxinfer.hpp       |  10 ++
+ .../src/gst-dxinputselector.cpp               |  28 +++-
+ .../src/gst-dxinputselector.hpp               |   1 +
+ gst-dxstream-plugin/src/gst-dxmsgbroker.cpp   |  41 +++++-
+ gst-dxstream-plugin/src/gst-dxmsgbroker.hpp   |   5 +
+ .../element/inference/test_dxinfer_stats.cpp  | 136 ++++++++++++++++++
+ .../test_dxmsgbroker_failure_streak.cpp       |  34 +++++
+ .../test_dxinputselector_live_deadline.cpp    |  17 +++
+ 9 files changed, 296 insertions(+), 4 deletions(-)
+ create mode 100644 test/base/element/inference/test_dxinfer_stats.cpp
+
+diff --git a/gst-dxstream-plugin/src/gst-dxinfer.cpp b/gst-dxstream-plugin/src/gst-dxinfer.cpp
+index 22e89bf..b345898 100644
+--- a/gst-dxstream-plugin/src/gst-dxinfer.cpp
++++ b/gst-dxstream-plugin/src/gst-dxinfer.cpp
+@@ -16,6 +16,7 @@ enum class PropertyID {
+     PROP_USE_ORT,
+     PROP_BACKEND,
+     PROP_EOS_DRAIN_TIMEOUT,
++    PROP_STATS,
+     N_PROPERTIES
+ };
+ 
+@@ -217,6 +218,15 @@ static void gst_dxinfer_get_property(GObject *object, guint property_id,
+         g_value_set_uint64(value, self->_eos_drain_timeout);
+         GST_OBJECT_UNLOCK(self);
+         break;
++    case PropertyID::PROP_STATS:
++        g_value_take_boxed(value, gst_structure_new(
++            "application/x-dxinfer-stats",
++            "dropped-qos", G_TYPE_UINT64, self->_stats.dropped_qos.load(),
++            "dropped-throttled", G_TYPE_UINT64, self->_stats.dropped_throttled.load(),
++            "dropped-no-meta", G_TYPE_UINT64, self->_stats.dropped_no_meta.load(),
++            "dropped-after-eos", G_TYPE_UINT64, self->_stats.dropped_after_eos.load(),
++            nullptr));
++        break;
+     default:
+         G_OBJECT_WARN_INVALID_PROPERTY_ID(object, property_id, pspec);
+         break;
+@@ -322,6 +332,11 @@ static void handle_ready_to_paused(GstDxInfer *self) {
+     self->_eos_ctx.stream_eos_arrived.clear();
+     self->_eos_ctx.stream_pending_buffers.clear();
+ 
++    self->_stats.dropped_qos = 0;
++    self->_stats.dropped_throttled = 0;
++    self->_stats.dropped_no_meta = 0;
++    self->_stats.dropped_after_eos = 0;
++
+     self->_timing_ctx.avg_latency = 0;
+     self->_timing_ctx.throughput_count = 0;
+     self->_timing_ctx.throughput_start = std::chrono::steady_clock::now();
+@@ -454,6 +469,14 @@ static void gst_dxinfer_class_init(GstDxInferClass *klass) {
+         "indefinitely.",
+         0, G_MAXUINT64, DEFAULT_EOS_DRAIN_TIMEOUT,
+         (GParamFlags)(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
++    obj_properties[static_cast<int>(PropertyID::PROP_STATS)] = g_param_spec_boxed(
++        "stats", "Statistics",
++        "Buffers dropped without an error since the element started, by reason: "
++        "dropped-qos (late per a QoS underflow), dropped-throttled (per a QoS "
++        "throttle), dropped-no-meta (no DXFrameMeta), dropped-after-eos "
++        "(stream already ended).",
++        GST_TYPE_STRUCTURE,
++        (GParamFlags)(G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
+ 
+     g_object_class_install_properties(gobject_class, static_cast<int>(PropertyID::N_PROPERTIES),
+                                       obj_properties.data());
+@@ -777,6 +800,7 @@ static void gst_dxinfer_init(GstDxInfer *self) {
+     new (&self->_eos_ctx.eos_lock) std::mutex();
+     new (&self->_eos_ctx.stream_eos_arrived) std::set<int>();
+     new (&self->_eos_ctx.stream_pending_buffers) std::map<int, int>();
++    new (&self->_stats) GstDxInferStats();
+ }
+ 
+ gint64 calculate_average(GQueue *queue) {
+@@ -1103,11 +1127,13 @@ static GstFlowReturn gst_dxinfer_chain(GstPad *pad, GstObject *parent,
+                    GST_TIME_ARGS(GST_BUFFER_PTS(buf)));
+ 
+     if (should_drop_buffer_due_to_qos(self, buf)) {
++        self->_stats.dropped_qos++;
+         gst_buffer_unref(buf);
+         return GST_FLOW_OK;
+     }
+ 
+     if (should_drop_buffer_due_to_throttling(self, buf)) {
++        self->_stats.dropped_throttled++;
+         gst_buffer_unref(buf);
+         return GST_FLOW_OK;
+     }
+@@ -1116,6 +1142,7 @@ static GstFlowReturn gst_dxinfer_chain(GstPad *pad, GstObject *parent,
+ 
+     if (!frame_meta) {
+         GST_LOG_OBJECT(self, "No DXFrameMeta, dropping buffer");
++        self->_stats.dropped_no_meta++;
+         gst_buffer_unref(buf);
+         return GST_FLOW_OK;
+     }
+@@ -1124,6 +1151,7 @@ static GstFlowReturn gst_dxinfer_chain(GstPad *pad, GstObject *parent,
+         std::unique_lock<std::mutex> lock(self->_eos_ctx.eos_lock);
+         if (self->_eos_ctx.stream_eos_arrived.count(frame_meta->_stream_id) > 0) {
+             GST_INFO_OBJECT(self, "EOS Already Arrived [%d] ", frame_meta->_stream_id);
++            self->_stats.dropped_after_eos++;
+             gst_buffer_unref(buf);
+             return GST_FLOW_OK;
+         }
+diff --git a/gst-dxstream-plugin/src/gst-dxinfer.hpp b/gst-dxstream-plugin/src/gst-dxinfer.hpp
+index 1771bef..877a58d 100644
+--- a/gst-dxstream-plugin/src/gst-dxinfer.hpp
++++ b/gst-dxstream-plugin/src/gst-dxinfer.hpp
+@@ -58,6 +58,15 @@ struct GstDxInferEosContext {
+     std::map<int, int> stream_pending_buffers;
+ };
+ 
++/* Buffers chain() drops while returning GST_FLOW_OK, one counter per reason.
++ * Exposed as the read-only `stats` structure. */
++struct GstDxInferStats {
++    std::atomic<guint64> dropped_qos{0};
++    std::atomic<guint64> dropped_throttled{0};
++    std::atomic<guint64> dropped_no_meta{0};
++    std::atomic<guint64> dropped_after_eos{0};
++};
++
+ struct GstDxInferTimingContext {
+     gint64 avg_latency;
+     GQueue *recent_latencies;
+@@ -91,6 +100,7 @@ struct _GstDxInfer {
+     GstDxInferPushContext _push_ctx;
+     GstDxInferEosContext _eos_ctx;
+     GstDxInferTimingContext _timing_ctx;
++    GstDxInferStats _stats;
+ };
+ 
+ using GstDxInfer = struct _GstDxInfer;
+diff --git a/gst-dxstream-plugin/src/gst-dxinputselector.cpp b/gst-dxstream-plugin/src/gst-dxinputselector.cpp
+index e96b727..494ea71 100644
+--- a/gst-dxstream-plugin/src/gst-dxinputselector.cpp
++++ b/gst-dxstream-plugin/src/gst-dxinputselector.cpp
+@@ -9,7 +9,7 @@
+ GST_DEBUG_CATEGORY_STATIC(gst_dxinputselector_debug_category);
+ #define GST_CAT_DEFAULT gst_dxinputselector_debug_category
+ 
+-enum class PropertyID { PROP_0, PROP_MAX_QUEUE_SIZE };
++enum class PropertyID { PROP_0, PROP_MAX_QUEUE_SIZE, PROP_STATS };
+ 
+ static GstStaticPadTemplate sink_template = GST_STATIC_PAD_TEMPLATE(
+     "sink_%u", GST_PAD_SINK, GST_PAD_REQUEST, GST_STATIC_CAPS("video/x-raw"));
+@@ -53,9 +53,15 @@ static void gst_dxinputselector_set_property(GObject *object, guint prop_id,
+ static void gst_dxinputselector_get_property(GObject *object, guint prop_id,
+                                              GValue *value,
+                                              GParamSpec *pspec) {
+-    const auto *self = GST_DXINPUTSELECTOR(object);
++    auto *self = GST_DXINPUTSELECTOR(object);
+     if (static_cast<PropertyID>(prop_id) == PropertyID::PROP_MAX_QUEUE_SIZE) {
+         g_value_set_uint(value, self->_max_queue_size);
++    } else if (static_cast<PropertyID>(prop_id) == PropertyID::PROP_STATS) {
++        GST_OBJECT_LOCK(self);
++        g_value_take_boxed(value, gst_structure_new(
++            "application/x-dxinputselector-stats",
++            "pads-skipped", G_TYPE_UINT64, self->_pads_skipped, nullptr));
++        GST_OBJECT_UNLOCK(self);
+     } else {
+         G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
+     }
+@@ -261,7 +267,10 @@ gst_dxinputselector_aggregate(GstAggregator *agg, gboolean timeout) {
+         if (!buf) {
+             /* Live deadline passed: skip this pad for this round instead of
+              * blocking the others.  Never taken with non-live upstream. */
+-            if (timeout) continue;
++            if (timeout) {
++                self->_pads_skipped++;
++                continue;
++            }
+             GST_OBJECT_UNLOCK(agg);
+             for (auto &p : peeked) gst_buffer_unref(p.second);
+             return GST_AGGREGATOR_FLOW_NEED_DATA;
+@@ -305,6 +314,9 @@ gst_dxinputselector_aggregate(GstAggregator *agg, gboolean timeout) {
+ static gboolean gst_dxinputselector_start(GstAggregator *agg) {
+     GstDxInputSelector *self = GST_DXINPUTSELECTOR(agg);
+     self->_stream_eos_sent.clear();
++    GST_OBJECT_LOCK(self);
++    self->_pads_skipped = 0;
++    GST_OBJECT_UNLOCK(self);
+     return TRUE;
+ }
+ 
+@@ -357,6 +369,15 @@ static void gst_dxinputselector_class_init(GstDxInputSelectorClass *klass) {
+             (GParamFlags)(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS |
+                           GST_PARAM_MUTABLE_READY)));
+ 
++    g_object_class_install_property(
++        gobject_class, static_cast<guint>(PropertyID::PROP_STATS),
++        g_param_spec_boxed(
++            "stats", "Statistics",
++            "Since the element started: pads-skipped (pads left out of a round "
++            "because the live deadline passed).",
++            GST_TYPE_STRUCTURE,
++            (GParamFlags)(G_PARAM_READABLE | G_PARAM_STATIC_STRINGS)));
++
+     gst_element_class_set_static_metadata(
+         element_class, "DXInputSelector", "Generic",
+         "Input Selection from Multi Channel Streams (N:1)",
+@@ -390,6 +411,7 @@ static void gst_dxinputselector_init(GstDxInputSelector *self) {
+     new (&self->_stream_caps) std::map<int, GstCaps *>();
+     g_mutex_init(&self->_stream_caps_lock);
+     self->_max_queue_size = 2;
++    self->_pads_skipped = 0;
+ }
+ 
+ static void gst_dxinputselector_finalize(GObject *object) {
+diff --git a/gst-dxstream-plugin/src/gst-dxinputselector.hpp b/gst-dxstream-plugin/src/gst-dxinputselector.hpp
+index 558e559..97e874e 100644
+--- a/gst-dxstream-plugin/src/gst-dxinputselector.hpp
++++ b/gst-dxstream-plugin/src/gst-dxinputselector.hpp
+@@ -21,6 +21,7 @@ struct _GstDxInputSelector {
+     std::map<int, GstCaps *> _stream_caps;
+     GMutex _stream_caps_lock;
+     guint _max_queue_size;
++    guint64 _pads_skipped; /* `stats`. GST_OBJECT_LOCK */
+ };
+ 
+ G_END_DECLS
+diff --git a/gst-dxstream-plugin/src/gst-dxmsgbroker.cpp b/gst-dxstream-plugin/src/gst-dxmsgbroker.cpp
+index 5cd244f..a833167 100644
+--- a/gst-dxstream-plugin/src/gst-dxmsgbroker.cpp
++++ b/gst-dxstream-plugin/src/gst-dxmsgbroker.cpp
+@@ -5,7 +5,8 @@
+ #include "dx_msgbrokerl_kafka.hpp"
+ #include "dx_msgbrokerl_mqtt.hpp"
+ 
+-enum class PropertyID { PROP_0, PROP_BROKER_NAME, PROP_CONN_INFO, PROP_CONFIG, PROP_TOPIC };
++enum class PropertyID { PROP_0, PROP_BROKER_NAME, PROP_CONN_INFO, PROP_CONFIG, PROP_TOPIC,
++                        PROP_STATS };
+ 
+ GST_DEBUG_CATEGORY_STATIC(gst_dxmsgbroker_debug_category);
+ #define GST_CAT_DEFAULT gst_dxmsgbroker_debug_category
+@@ -78,6 +79,16 @@ static void gst_dxmsgbroker_class_init(GstDxMsgBrokerClass *klass) {
+                             "The topic name for publishing messages. Required.",
+                             nullptr, G_PARAM_READWRITE));
+ 
++    g_object_class_install_property(
++        gobject_class, static_cast<guint>(PropertyID::PROP_STATS),
++        g_param_spec_boxed(
++            "stats", "Statistics",
++            "Buffers rendered since the element started: published (handed to "
++            "the broker), failed (broker disconnected or send rejected), "
++            "no-message (no message meta, expected with message-interval > 1).",
++            GST_TYPE_STRUCTURE,
++            (GParamFlags)(G_PARAM_READABLE | G_PARAM_STATIC_STRINGS)));
++
+     gst_element_class_add_pad_template(
+         GST_ELEMENT_CLASS(klass),
+         gst_pad_template_new("sink", GST_PAD_SINK, GST_PAD_ALWAYS,
+@@ -104,6 +115,9 @@ static void gst_dxmsgbroker_init(GstDxMsgBroker *self) {
+     self->_topic = nullptr;
+     self->_msgbroker_count = 0;
+     self->_consecutive_failures = 0;
++    self->_published = 0;
++    self->_failed = 0;
++    self->_no_message = 0;
+ 
+     self->_handle = nullptr;
+     self->_broker_name = g_strdup(DXMSG_BAL_BROKER_NAME_MQTT);
+@@ -166,6 +180,16 @@ static void gst_dxmsgbroker_get_property(GObject *object, guint prop_id,
+     case PropertyID::PROP_TOPIC:
+         g_value_set_string(value, self->_topic);
+         break;
++    case PropertyID::PROP_STATS:
++        GST_OBJECT_LOCK(self);
++        g_value_take_boxed(value, gst_structure_new(
++            "application/x-dxmsgbroker-stats",
++            "published", G_TYPE_UINT64, self->_published,
++            "failed", G_TYPE_UINT64, self->_failed,
++            "no-message", G_TYPE_UINT64, self->_no_message,
++            nullptr));
++        GST_OBJECT_UNLOCK(self);
++        break;
+     default:
+         G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
+         break;
+@@ -243,6 +267,11 @@ static gboolean gst_dxmsgbroker_start(GstBaseSink *sink) {
+     GST_INFO_OBJECT(self, "Successfully connected to broker");
+ 
+     self->_msgbroker_count = 0;
++    GST_OBJECT_LOCK(self);
++    self->_published = 0;
++    self->_failed = 0;
++    self->_no_message = 0;
++    GST_OBJECT_UNLOCK(self);
+     return TRUE;
+ }
+ 
+@@ -261,6 +290,12 @@ static gboolean gst_dxmsgbroker_stop(GstBaseSink *sink) {
+     return TRUE;
+ }
+ 
++static void stats_inc(GstDxMsgBroker *self, guint64 *counter) {
++    GST_OBJECT_LOCK(self);
++    (*counter)++;
++    GST_OBJECT_UNLOCK(self);
++}
++
+ static GstFlowReturn gst_dxmsgbroker_render(GstBaseSink *sink,
+                                             GstBuffer *buffer) {
+     GstDxMsgBroker *self = GST_DXMSGBROKER(sink);
+@@ -271,6 +306,7 @@ static GstFlowReturn gst_dxmsgbroker_render(GstBaseSink *sink,
+     static const guint MAX_CONSECUTIVE_FAILURES = 10;
+ 
+     if (!self->_handle) {
++        stats_inc(self, &self->_failed);
+         self->_consecutive_failures++;
+         GST_WARNING_OBJECT(self,
+             "Broker not connected, dropping message (%u/%u consecutive failures)",
+@@ -296,6 +332,7 @@ static GstFlowReturn gst_dxmsgbroker_render(GstBaseSink *sink,
+         DxMsg_Bal_Error_t error = self->_send_function(self->_handle, topic,
+                                      payload->_data, payload->_size);
+         if (error != DxMsg_Bal_Error::DXMSG_BAL_OK) {
++            stats_inc(self, &self->_failed);
+             self->_consecutive_failures++;
+             GST_WARNING_OBJECT(self,
+                 "Failed to publish message (%u/%u consecutive failures)",
+@@ -308,9 +345,11 @@ static GstFlowReturn gst_dxmsgbroker_render(GstBaseSink *sink,
+             }
+             return GST_FLOW_OK;
+         }
++        stats_inc(self, &self->_published);
+         /* Only a successful publish ends a failure streak. */
+         self->_consecutive_failures = 0;
+     } else {
++        stats_inc(self, &self->_no_message);
+         GST_LOG_OBJECT(self, "No DxMsgMeta on buffer, nothing to publish");
+     }
+ 
+diff --git a/gst-dxstream-plugin/src/gst-dxmsgbroker.hpp b/gst-dxstream-plugin/src/gst-dxmsgbroker.hpp
+index de2c9cf..f7f46a7 100644
+--- a/gst-dxstream-plugin/src/gst-dxmsgbroker.hpp
++++ b/gst-dxstream-plugin/src/gst-dxmsgbroker.hpp
+@@ -55,6 +55,11 @@ struct _GstDxMsgBroker {
+     guint64 _msgbroker_count;
+ 
+     guint _consecutive_failures;
++
++    /* `stats` counters. GST_OBJECT_LOCK */
++    guint64 _published;
++    guint64 _failed;
++    guint64 _no_message;
+ };
+ 
+ G_END_DECLS
+diff --git a/test/base/element/inference/test_dxinfer_stats.cpp b/test/base/element/inference/test_dxinfer_stats.cpp
+new file mode 100644
+index 0000000..a322721
+--- /dev/null
++++ b/test/base/element/inference/test_dxinfer_stats.cpp
+@@ -0,0 +1,136 @@
++// dxinfer — `stats` counts every buffer chain() drops without an error,
++// by reason.  White-box, stub backend, no NPU.
++
++#include <gst/check/gstcheck.h>
++#include <gst/gst.h>
++#include "gst-dxinfer.hpp"
++#include "meta_helpers.hpp"
++
++class StubInferBackend final : public IInferBackend {
++public:
++    bool Init(const InferBackendOptions&) override { return true; }
++    bool Put(void*, void*) override { return true; }
++    bool Get(dxs::DXTensors&) override { return true; }
++    void Flush() override {}
++    void Reset() override {}
++    size_t GetOutputBufferSize() const override { return 0; }
++    const char* GetName() const override { return "stub"; }
++    bool IsFlushed() const override { return false; }
++};
++
++struct InferUnderTest {
++    GstDxInfer *infer;
++    GstPad *sinkpad;
++    GstPad *srcpad;
++
++    static InferUnderTest make() {
++        InferUnderTest t;
++        t.infer = GST_DXINFER(gst_element_factory_make("dxinfer", nullptr));
++        fail_unless(t.infer != nullptr);
++        t.infer->_backend.reset(new StubInferBackend);
++        t.sinkpad = gst_element_get_static_pad(GST_ELEMENT(t.infer), "sink");
++        t.srcpad = gst_element_get_static_pad(GST_ELEMENT(t.infer), "src");
++        gst_pad_set_active(t.sinkpad, TRUE);
++        gst_pad_set_active(t.srcpad, TRUE);  // QoS arrives on the srcpad
++        return t;
++    }
++
++    GstFlowReturn chain(GstClockTime pts, int stream_id = -1) {
++        GstBuffer *buf = gst_buffer_new();
++        GST_BUFFER_PTS(buf) = pts;
++        if (stream_id >= 0)
++            dxtest::make_frame_meta(buf, stream_id, 4, 4);
++        return GST_PAD_CHAINFUNC(sinkpad)(sinkpad, GST_OBJECT(infer), buf);
++    }
++
++    void qos(GstQOSType type, GstClockTimeDiff diff) {
++        gst_pad_send_event(srcpad, gst_event_new_qos(type, 1.0, diff, 0));
++    }
++
++    guint64 stat(const char *field) {
++        GstStructure *s = nullptr;
++        g_object_get(infer, "stats", &s, nullptr);
++        fail_unless(s != nullptr, "dxinfer has no stats");
++        fail_unless(gst_structure_has_name(s, "application/x-dxinfer-stats"));
++        guint64 v = 0;
++        fail_unless(gst_structure_get_uint64(s, field, &v),
++                    "stats has no guint64 field %s", field);
++        gst_structure_free(s);
++        return v;
++    }
++
++    void destroy() {
++        gst_pad_set_active(srcpad, FALSE);
++        gst_pad_set_active(sinkpad, FALSE);
++        gst_object_unref(srcpad);
++        gst_object_unref(sinkpad);
++        gst_object_unref(infer);
++    }
++};
++
++GST_START_TEST(starts_at_zero) {
++    auto t = InferUnderTest::make();
++    for (const char *f : {"dropped-qos", "dropped-throttled", "dropped-no-meta",
++                          "dropped-after-eos"})
++        fail_unless_equals_uint64(t.stat(f), 0);
++    t.destroy();
++}
++GST_END_TEST;
++
++GST_START_TEST(counts_buffers_without_frame_meta) {
++    auto t = InferUnderTest::make();
++    for (int i = 0; i < 3; i++)
++        fail_unless_equals_int(t.chain(i * GST_MSECOND), GST_FLOW_OK);
++    fail_unless_equals_uint64(t.stat("dropped-no-meta"), 3);
++    t.destroy();
++}
++GST_END_TEST;
++
++GST_START_TEST(counts_buffers_of_an_ended_stream) {
++    auto t = InferUnderTest::make();
++    {
++        std::lock_guard<std::mutex> lock(t.infer->_eos_ctx.eos_lock);
++        t.infer->_eos_ctx.stream_eos_arrived.insert(5);
++    }
++    fail_unless_equals_int(t.chain(0, 5), GST_FLOW_OK);
++    fail_unless_equals_int(t.chain(GST_MSECOND, 5), GST_FLOW_OK);
++    fail_unless_equals_uint64(t.stat("dropped-after-eos"), 2);
++    fail_unless_equals_uint64(t.stat("dropped-no-meta"), 0);
++    t.destroy();
++}
++GST_END_TEST;
++
++GST_START_TEST(counts_qos_underflow_drops) {
++    auto t = InferUnderTest::make();
++    t.qos(GST_QOS_TYPE_UNDERFLOW, GST_SECOND);  // earliest = 1 s
++    fail_unless_equals_int(t.chain(100 * GST_MSECOND), GST_FLOW_OK);
++    fail_unless_equals_uint64(t.stat("dropped-qos"), 1);
++    fail_unless_equals_uint64(t.stat("dropped-no-meta"), 0);
++    t.destroy();
++}
++GST_END_TEST;
++
++GST_START_TEST(counts_qos_throttle_drops) {
++    auto t = InferUnderTest::make();
++    t.qos(GST_QOS_TYPE_THROTTLE, GST_SECOND);  // one buffer per second
++    fail_unless_equals_int(t.chain(0), GST_FLOW_OK);
++    fail_unless_equals_int(t.chain(10 * GST_MSECOND), GST_FLOW_OK);
++    fail_unless_equals_uint64(t.stat("dropped-throttled"), 2);
++    t.destroy();
++}
++GST_END_TEST;
++
++static Suite *dxinfer_stats_suite(void) {
++    Suite *s = suite_create("dxinfer_stats");
++    TCase *tc = tcase_create("contract");
++    tcase_set_timeout(tc, 30.0);
++    suite_add_tcase(s, tc);
++    tcase_add_test(tc, starts_at_zero);
++    tcase_add_test(tc, counts_buffers_without_frame_meta);
++    tcase_add_test(tc, counts_buffers_of_an_ended_stream);
++    tcase_add_test(tc, counts_qos_underflow_drops);
++    tcase_add_test(tc, counts_qos_throttle_drops);
++    return s;
++}
++
++GST_CHECK_MAIN(dxinfer_stats);
+diff --git a/test/base/element/messaging/test_dxmsgbroker_failure_streak.cpp b/test/base/element/messaging/test_dxmsgbroker_failure_streak.cpp
+index 3578a7f..473ecc7 100644
+--- a/test/base/element/messaging/test_dxmsgbroker_failure_streak.cpp
++++ b/test/base/element/messaging/test_dxmsgbroker_failure_streak.cpp
+@@ -1,5 +1,6 @@
+ // dxmsgbroker — only a successful publish ends a failure streak
+ // Message-less buffers (message-interval > 1) must not reset it.
++// `stats` counts each render outcome.
+ // White-box: stub broker handle and send function.
+ 
+ #include <gst/check/gstcheck.h>
+@@ -49,6 +50,18 @@ struct BrokerUnderTest {
+ 
+     GstFlowReturn render_no_message() { return render(gst_buffer_new()); }
+ 
++    guint64 stat(const char *field) {
++        GstStructure *s = nullptr;
++        g_object_get(broker, "stats", &s, nullptr);
++        fail_unless(s != nullptr, "dxmsgbroker has no stats");
++        fail_unless(gst_structure_has_name(s, "application/x-dxmsgbroker-stats"));
++        guint64 v = 0;
++        fail_unless(gst_structure_get_uint64(s, field, &v),
++                    "stats has no guint64 field %s", field);
++        gst_structure_free(s);
++        return v;
++    }
++
+     void destroy() {
+         broker->_handle = nullptr;  // not a real handle; nothing to disconnect
+         gst_object_unref(broker);
+@@ -93,6 +106,26 @@ GST_START_TEST(successful_publish_ends_the_streak) {
+ }
+ GST_END_TEST;
+ 
++GST_START_TEST(stats_count_each_outcome) {
++    auto t = BrokerUnderTest::make();
++
++    g_fail = false;
++    for (int i = 0; i < 3; i++) t.render_message();
++    g_fail = true;
++    for (int i = 0; i < 2; i++) t.render_message();
++    for (int i = 0; i < 4; i++) t.render_no_message();
++    DxMsg_Bal_Handle_t h = t.broker->_handle;
++    t.broker->_handle = nullptr;  // disconnected: the message is lost too
++    t.render_message();
++    t.broker->_handle = h;
++
++    fail_unless_equals_uint64(t.stat("published"), 3);
++    fail_unless_equals_uint64(t.stat("failed"), 3);
++    fail_unless_equals_uint64(t.stat("no-message"), 4);
++    t.destroy();
++}
++GST_END_TEST;
++
+ static Suite *dxmsgbroker_failure_streak_suite(void) {
+     Suite *s = suite_create("dxmsgbroker_failure_streak");
+     TCase *tc = tcase_create("contract");
+@@ -100,6 +133,7 @@ static Suite *dxmsgbroker_failure_streak_suite(void) {
+     suite_add_tcase(s, tc);
+     tcase_add_test(tc, message_less_buffers_do_not_end_the_streak);
+     tcase_add_test(tc, successful_publish_ends_the_streak);
++    tcase_add_test(tc, stats_count_each_outcome);
+     return s;
+ }
+ 
+diff --git a/test/base/element/multistream/test_dxinputselector_live_deadline.cpp b/test/base/element/multistream/test_dxinputselector_live_deadline.cpp
+index 38c0781..7344e86 100644
+--- a/test/base/element/multistream/test_dxinputselector_live_deadline.cpp
++++ b/test/base/element/multistream/test_dxinputselector_live_deadline.cpp
+@@ -2,6 +2,7 @@
+ //   live:     a silent pad does not stall the others
+ //   live:     with no data the srcpad task sleeps, not spins
+ //   non-live: unchanged, a silent pad still blocks
++//   `stats` pads-skipped counts the skips
+ 
+ #include <gst/check/gstcheck.h>
+ #include <gst/gst.h>
+@@ -74,6 +75,17 @@ static int drain(GstElement *sink, GstClockTime wait) {
+     return n;
+ }
+ 
++static guint64 pads_skipped(GstElement *agg) {
++    GstStructure *s = nullptr;
++    g_object_get(agg, "stats", &s, nullptr);
++    fail_unless(s != nullptr, "dxinputselector has no stats");
++    fail_unless(gst_structure_has_name(s, "application/x-dxinputselector-stats"));
++    guint64 v = 0;
++    fail_unless(gst_structure_get_uint64(s, "pads-skipped", &v));
++    gst_structure_free(s);
++    return v;
++}
++
+ static double cpu_seconds() {
+     struct rusage ru;
+     getrusage(RUSAGE_SELF, &ru);
+@@ -97,6 +109,10 @@ GST_START_TEST(live_silent_pad_does_not_stall_others) {
+     fail_unless(got >= pushed - 2,
+                 "live pad stalled by a silent pad: %d of %d buffers out",
+                 got, pushed);
++    // The silent pad was left out of (nearly) every round.
++    guint64 skipped = pads_skipped(p.agg);
++    fail_unless(skipped >= (guint64)(got - 2),
++                "pads-skipped %" G_GUINT64_FORMAT " for %d rounds", skipped, got);
+ 
+     gst_element_set_state(p.pipe, GST_STATE_NULL);
+     gst_object_unref(p.pipe);
+@@ -143,6 +159,7 @@ GST_START_TEST(non_live_silent_pad_still_blocks) {
+     got = drain(p.sink, 500 * GST_MSECOND);
+     fail_unless(got == 5, "expected 5 buffers after the other pad ended, got %d",
+                 got);
++    fail_unless_equals_uint64(pads_skipped(p.agg), 0);
+ 
+     gst_element_set_state(p.pipe, GST_STATE_NULL);
+     gst_object_unref(p.pipe);
+-- 
+2.43.0
+

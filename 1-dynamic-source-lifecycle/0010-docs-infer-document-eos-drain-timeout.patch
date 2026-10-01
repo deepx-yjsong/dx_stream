@@ -1,0 +1,25 @@
+From 3616b6f7428dee0a9a18bba0729ea13d34e493f7 Mon Sep 17 00:00:00 2001
+From: deepx-yjsong <yjsong@deepx.ai>
+Date: Tue, 29 Sep 2026 11:31:11 +0900
+Subject: [PATCH 10/10] docs(infer): document eos-drain-timeout
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ docs/source/docs/Elements/03_02_DxInfer.md | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/docs/source/docs/Elements/03_02_DxInfer.md b/docs/source/docs/Elements/03_02_DxInfer.md
+index c51d3b0..17fa316 100644
+--- a/docs/source/docs/Elements/03_02_DxInfer.md
++++ b/docs/source/docs/Elements/03_02_DxInfer.md
+@@ -78,6 +78,7 @@ GObject
+ | `secondary-mode`   | Determines whether to operate in primary mode or secondary mode.                                     | Boolean   | `false`            |
+ | `use-ort`          | Determines whether to use ONNX Runtime (ORT) for inference.                                          | Boolean   | `true`             |
+ | `backend`          | Selects the inference backend: `auto` or `dxrt`.                                                     | Enum      | `auto`             |
++| `eos-drain-timeout` | How long an EOS (global or per-stream) waits for buffers still on the device before it is forwarded anyway, in nanoseconds. `0` waits indefinitely. | Unsigned Integer 64 | `5000000000` (5 s) |
+ 
+ 
+ ### **Example JSON Configuration**
+-- 
+2.43.0
+

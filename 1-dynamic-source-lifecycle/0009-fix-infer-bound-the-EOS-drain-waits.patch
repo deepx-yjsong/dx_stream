@@ -1,0 +1,330 @@
+From bb0f6c30292612a4797e03dd7dc0a4a08d1fb616 Mon Sep 17 00:00:00 2001
+From: deepx-yjsong <yjsong@deepx.ai>
+Date: Mon, 28 Sep 2026 16:14:02 +0900
+Subject: [PATCH 09/10] fix(infer): bound the EOS drain waits
+
+Both EOS drains (per-stream and global) waited without a bound on the
+streaming thread. A device that stops completing work pinned the thread
+forever, and on the global EOS the pipeline could not shut down.
+
+Add eos-drain-timeout (ns, default 5 s, 0 = unbounded). On expiry the EOS
+is forwarded with a WARNING. The backend Put() backpressure wait is left
+unbounded on purpose: blocking there is the intended degradation under load.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ gst-dxstream-plugin/src/gst-dxinfer.cpp       |  55 +++++-
+ gst-dxstream-plugin/src/gst-dxinfer.hpp       |   1 +
+ .../test_dxinfer_eos_drain_timeout.cpp        | 162 ++++++++++++++++++
+ 3 files changed, 216 insertions(+), 2 deletions(-)
+ create mode 100644 test/base/element/inference/test_dxinfer_eos_drain_timeout.cpp
+
+diff --git a/gst-dxstream-plugin/src/gst-dxinfer.cpp b/gst-dxstream-plugin/src/gst-dxinfer.cpp
+index 849e898..22e89bf 100644
+--- a/gst-dxstream-plugin/src/gst-dxinfer.cpp
++++ b/gst-dxstream-plugin/src/gst-dxinfer.cpp
+@@ -15,9 +15,13 @@ enum class PropertyID {
+     PROP_CONFIG_PATH,
+     PROP_USE_ORT,
+     PROP_BACKEND,
++    PROP_EOS_DRAIN_TIMEOUT,
+     N_PROPERTIES
+ };
+ 
++/* A healthy drain takes milliseconds. */
++#define DEFAULT_EOS_DRAIN_TIMEOUT (5 * GST_SECOND)
++
+ #define GST_TYPE_DXINFER_BACKEND (gst_dxinfer_backend_get_type())
+ static GType gst_dxinfer_backend_get_type() {
+     static GType type = 0;
+@@ -171,6 +175,12 @@ static void gst_dxinfer_set_property(GObject *object, guint property_id,
+         self->_backend_type = static_cast<BackendType>(g_value_get_enum(value));
+         break;
+     }
++    case PropertyID::PROP_EOS_DRAIN_TIMEOUT: {
++        GST_OBJECT_LOCK(self);
++        self->_eos_drain_timeout = g_value_get_uint64(value);
++        GST_OBJECT_UNLOCK(self);
++        break;
++    }
+     default:
+         G_OBJECT_WARN_INVALID_PROPERTY_ID(object, property_id, pspec);
+         break;
+@@ -202,6 +212,11 @@ static void gst_dxinfer_get_property(GObject *object, guint property_id,
+     case PropertyID::PROP_BACKEND:
+         g_value_set_enum(value, static_cast<int>(self->_backend_type));
+         break;
++    case PropertyID::PROP_EOS_DRAIN_TIMEOUT:
++        GST_OBJECT_LOCK(self);
++        g_value_set_uint64(value, self->_eos_drain_timeout);
++        GST_OBJECT_UNLOCK(self);
++        break;
+     default:
+         G_OBJECT_WARN_INVALID_PROPERTY_ID(object, property_id, pspec);
+         break;
+@@ -432,6 +447,13 @@ static void gst_dxinfer_class_init(GstDxInferClass *klass) {
+         "Select inference backend (auto, dxrt, dxvnpu).",
+         GST_TYPE_DXINFER_BACKEND, static_cast<int>(BackendType::AUTO),
+         G_PARAM_READWRITE);
++    obj_properties[static_cast<int>(PropertyID::PROP_EOS_DRAIN_TIMEOUT)] = g_param_spec_uint64(
++        "eos-drain-timeout", "EOS drain timeout",
++        "How long an EOS (global or per-stream) waits for buffers still on the "
++        "device before it is forwarded anyway, in nanoseconds. 0 waits "
++        "indefinitely.",
++        0, G_MAXUINT64, DEFAULT_EOS_DRAIN_TIMEOUT,
++        (GParamFlags)(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+ 
+     g_object_class_install_properties(gobject_class, static_cast<int>(PropertyID::N_PROPERTIES),
+                                       obj_properties.data());
+@@ -450,6 +472,24 @@ static void gst_dxinfer_class_init(GstDxInferClass *klass) {
+     element_class->change_state = dxinfer_change_state;
+ }
+ 
++/* Wait for `done`, bounded by eos-drain-timeout (0 = unbounded) so a stuck
++ * device cannot pin the streaming thread.  Returns FALSE on expiry. */
++template <typename Pred>
++static gboolean wait_for_drain(GstDxInfer *self,
++                               std::unique_lock<std::mutex> &lock, Pred done) {
++    GST_OBJECT_LOCK(self);
++    const guint64 timeout = self->_eos_drain_timeout;
++    GST_OBJECT_UNLOCK(self);
++
++    if (timeout == 0) {
++        self->_push_ctx.cv.wait(lock, done);
++        return TRUE;
++    }
++    return self->_push_ctx.cv.wait_for(
++               lock, std::chrono::nanoseconds(timeout), done)
++               ? TRUE : FALSE;
++}
++
+ gboolean handle_custom_downstream_event(GstDxInfer *self, GstEvent *event) {
+     gboolean res = TRUE;
+     const GstStructure *s_check = gst_event_get_structure(event);
+@@ -473,12 +513,17 @@ gboolean handle_custom_downstream_event(GstDxInfer *self, GstEvent *event) {
+             if (!self->_secondary_mode) {
+                 std::unique_lock<std::mutex> lock(self->_push_ctx.push_lock);
+                 /* find(): operator[] would insert an entry. */
+-                self->_push_ctx.cv.wait(lock, [self, stream_id] {
++                const gboolean drained = wait_for_drain(self, lock, [self, stream_id] {
+                     std::lock_guard<std::mutex> eos_lk(self->_eos_ctx.eos_lock);
+                     auto it = self->_eos_ctx.stream_pending_buffers.find(stream_id);
+                     return it == self->_eos_ctx.stream_pending_buffers.end() ||
+                            it->second <= 0 || !self->_push_ctx.push_running;
+                 });
++                if (!drained) {
++                    GST_WARNING_OBJECT(self,
++                        "Stream [%d]: buffers still on the device after "
++                        "eos-drain-timeout; forwarding EOS anyway", stream_id);
++                }
+             }
+ 
+             if (self->_push_ctx.push_running || self->_secondary_mode) {
+@@ -521,10 +566,15 @@ static gboolean gst_dxinfer_sink_event(GstPad *pad, GstObject *parent,
+             std::unique_lock<std::mutex> lock(self->_push_ctx.push_lock);
+             GST_DEBUG_OBJECT(self, "EOS: waiting for %zu queued buffers to drain",
+                             self->_push_ctx.push_queue.size());
+-            self->_push_ctx.cv.wait(lock, [self] {
++            const gboolean drained = wait_for_drain(self, lock, [self] {
+                 return self->_push_ctx.push_queue.empty() ||
+                        !self->_push_ctx.push_running;
+             });
++            if (!drained) {
++                GST_WARNING_OBJECT(self,
++                    "EOS: %zu buffer(s) still queued after eos-drain-timeout; "
++                    "forwarding EOS anyway", self->_push_ctx.push_queue.size());
++            }
+         }
+         if (self->_push_ctx.push_running || self->_secondary_mode) {
+             GST_DEBUG_OBJECT(self, "EOS: queue drained, forwarding downstream");
+@@ -703,6 +753,7 @@ static void gst_dxinfer_init(GstDxInfer *self) {
+     self->_secondary_mode = FALSE;
+     self->_use_ort = TRUE;
+     self->_backend_type = BackendType::AUTO;
++    self->_eos_drain_timeout = DEFAULT_EOS_DRAIN_TIMEOUT;
+     new (&self->_backend) std::unique_ptr<IInferBackend>();
+     self->_output_tensor_size = 0;
+ 
+diff --git a/gst-dxstream-plugin/src/gst-dxinfer.hpp b/gst-dxstream-plugin/src/gst-dxinfer.hpp
+index 308b6d4..1771bef 100644
+--- a/gst-dxstream-plugin/src/gst-dxinfer.hpp
++++ b/gst-dxstream-plugin/src/gst-dxinfer.hpp
+@@ -83,6 +83,7 @@ struct _GstDxInfer {
+     gchar *_model_path;
+     gchar *_config_path;
+     BackendType _backend_type;
++    guint64 _eos_drain_timeout; /* ns; 0 = wait indefinitely. GST_OBJECT_LOCK */
+ 
+     std::unique_ptr<IInferBackend> _backend;
+     size_t _output_tensor_size;
+diff --git a/test/base/element/inference/test_dxinfer_eos_drain_timeout.cpp b/test/base/element/inference/test_dxinfer_eos_drain_timeout.cpp
+new file mode 100644
+index 0000000..25af163
+--- /dev/null
++++ b/test/base/element/inference/test_dxinfer_eos_drain_timeout.cpp
+@@ -0,0 +1,162 @@
++// dxinfer — eos-drain-timeout bounds both EOS drains
++// A stuck device is simulated by a "running" push thread that never completes.
++// White-box, stub backend, no NPU.
++
++#include <gst/check/gstcheck.h>
++#include <gst/gst.h>
++#include "gst-dxinfer.hpp"
++
++#include <atomic>
++
++class StubInferBackend final : public IInferBackend {
++public:
++    bool Init(const InferBackendOptions&) override { return true; }
++    bool Put(void*, void*) override { return true; }
++    bool Get(dxs::DXTensors&) override { return true; }
++    void Flush() override {}
++    void Reset() override {}
++    size_t GetOutputBufferSize() const override { return 0; }
++    const char* GetName() const override { return "stub"; }
++    bool IsFlushed() const override { return false; }
++};
++
++struct Wedged {
++    GstDxInfer *infer;
++    GstPad *sinkpad;
++
++    // Push thread marked running; nothing ever completes.
++    static Wedged make(guint64 timeout) {
++        Wedged w;
++        w.infer = GST_DXINFER(gst_element_factory_make("dxinfer", nullptr));
++        fail_unless(w.infer != nullptr);
++        w.infer->_backend.reset(new StubInferBackend);
++        g_object_set(w.infer, "eos-drain-timeout", timeout, nullptr);
++        w.sinkpad = gst_element_get_static_pad(GST_ELEMENT(w.infer), "sink");
++        gst_pad_set_active(w.sinkpad, TRUE);
++        w.infer->_push_ctx.push_running = TRUE;
++        return w;
++    }
++
++    void unwedge() {
++        {
++            std::lock_guard<std::mutex> lock(infer->_push_ctx.push_lock);
++            infer->_push_ctx.push_running = FALSE;
++        }
++        infer->_push_ctx.cv.notify_all();
++    }
++
++    void destroy() {
++        unwedge();
++        while (!infer->_push_ctx.push_queue.empty()) {
++            gst_buffer_unref(infer->_push_ctx.push_queue.front().buffer);
++            infer->_push_ctx.push_queue.pop();
++        }
++        gst_pad_set_active(sinkpad, FALSE);
++        gst_object_unref(sinkpad);
++        gst_object_unref(infer);
++    }
++};
++
++static GstEvent *per_stream_eos(int stream_id) {
++    GstEvent *eos = gst_event_new_eos();
++    GstStructure *s = gst_structure_new(
++        "application/x-dx-wrapped-event",
++        "stream-id", G_TYPE_INT, stream_id,
++        "event", GST_TYPE_EVENT, eos, nullptr);
++    gst_event_unref(eos);
++    return gst_event_new_custom(GST_EVENT_CUSTOM_DOWNSTREAM, s);
++}
++
++// Send `ev` from another thread and report whether it returned within `wait`.
++struct Sender {
++    GstPad *pad;
++    GstEvent *ev;
++    std::atomic<bool> returned{false};
++
++    static gpointer run(gpointer data) {
++        auto *s = static_cast<Sender *>(data);
++        gst_pad_send_event(s->pad, s->ev);
++        s->returned = true;
++        return nullptr;
++    }
++};
++
++static bool returns_within(Sender &s, gulong wait_ms) {
++    for (gulong t = 0; t < wait_ms && !s.returned; t += 10)
++        g_usleep(10 * 1000);
++    return s.returned;
++}
++
++GST_START_TEST(per_stream_eos_drain_is_bounded) {
++    auto w = Wedged::make(200 * GST_MSECOND);
++    w.infer->_eos_ctx.stream_pending_buffers[8] = 1;  // never completes
++
++    Sender s{w.sinkpad, per_stream_eos(8)};
++    GThread *th = g_thread_new("send", Sender::run, &s);
++    bool ok = returns_within(s, 2000);
++    if (!ok) w.unwedge();  // let the thread finish so the test can report
++    g_thread_join(th);
++
++    fail_unless(ok, "per-stream EOS still blocked 2 s after a 200 ms "
++                    "eos-drain-timeout: a wedged device pins the thread");
++    w.destroy();
++}
++GST_END_TEST;
++
++GST_START_TEST(global_eos_drain_is_bounded) {
++    auto w = Wedged::make(200 * GST_MSECOND);
++    GstBuffer *stuck = gst_buffer_new();
++    w.infer->_push_ctx.push_queue.push({true, stuck});  // never completes
++
++    Sender s{w.sinkpad, gst_event_new_eos()};
++    GThread *th = g_thread_new("send", Sender::run, &s);
++    bool ok = returns_within(s, 2000);
++    if (!ok) w.unwedge();
++    g_thread_join(th);
++
++    fail_unless(ok, "EOS still blocked 2 s after a 200 ms eos-drain-timeout: "
++                    "a wedged device keeps the pipeline from shutting down");
++    w.destroy();
++}
++GST_END_TEST;
++
++// 0 keeps the previous unbounded wait.
++GST_START_TEST(zero_waits_until_drained) {
++    auto w = Wedged::make(0);
++    w.infer->_eos_ctx.stream_pending_buffers[9] = 1;
++
++    Sender s{w.sinkpad, per_stream_eos(9)};
++    GThread *th = g_thread_new("send", Sender::run, &s);
++    bool early = returns_within(s, 500);
++    w.unwedge();  // the drain can now complete (push thread stopped)
++    bool after = returns_within(s, 2000);
++    g_thread_join(th);
++
++    fail_if(early, "eos-drain-timeout=0 must wait for the drain");
++    fail_unless(after, "EOS did not return once the drain could complete");
++    w.destroy();
++}
++GST_END_TEST;
++
++GST_START_TEST(default_is_bounded) {
++    GstElement *e = gst_element_factory_make("dxinfer", nullptr);
++    guint64 t = 0;
++    g_object_get(e, "eos-drain-timeout", &t, nullptr);
++    fail_unless(t > 0, "the default must be bounded");
++    gst_object_unref(e);
++}
++GST_END_TEST;
++
++static Suite *dxinfer_eos_drain_timeout_suite(void) {
++    Suite *s = suite_create("dxinfer_eos_drain_timeout");
++    TCase *tc = tcase_create("contract");
++    tcase_set_timeout(tc, 30.0);
++    suite_add_tcase(s, tc);
++    tcase_add_test(tc, per_stream_eos_drain_is_bounded);
++    tcase_add_test(tc, global_eos_drain_is_bounded);
++    tcase_add_test(tc, zero_waits_until_drained);
++    tcase_add_test(tc, default_is_bounded);
++    return s;
++}
++
++GST_CHECK_MAIN(dxinfer_eos_drain_timeout);
+-- 
+2.43.0
+

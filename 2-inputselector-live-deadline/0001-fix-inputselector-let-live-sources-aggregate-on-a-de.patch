@@ -1,0 +1,102 @@
+From d95f72757e55beb687be315299c0b2b8ab792d82 Mon Sep 17 00:00:00 2001
+From: deepx-yjsong <yjsong@deepx.ai>
+Date: Mon, 28 Sep 2026 16:07:43 +0900
+Subject: [PATCH 1/3] fix(inputselector): let live sources aggregate on a
+ deadline
+
+With live sources a single silent pad blocked every stream: aggregate()
+returned NEED_DATA until all pads had a buffer. GstAggregator's live
+contract (wait for the latency, then call aggregate() with timeout=TRUE)
+was unused: there was no get_next_time, and timeout was ignored.
+
+get_next_time returns the running time of the earliest queued buffer, or
+NONE when no pad has data so the srcpad task sleeps. On timeout, pads
+without a buffer are skipped for that round (their buffers go out later).
+gst_aggregator_simple_get_next_time() is not usable: it reads the srcpad
+segment position, which this element never advances, and spins the task.
+
+Live only; non-live pipelines are unchanged. The deadline is the pipeline
+latency (upstream + the latency property, default 0).
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ .../src/gst-dxinputselector.cpp               | 41 ++++++++++++++++++-
+ 1 file changed, 40 insertions(+), 1 deletion(-)
+
+diff --git a/gst-dxstream-plugin/src/gst-dxinputselector.cpp b/gst-dxstream-plugin/src/gst-dxinputselector.cpp
+index 7a2f3af..c0de59d 100644
+--- a/gst-dxstream-plugin/src/gst-dxinputselector.cpp
++++ b/gst-dxstream-plugin/src/gst-dxinputselector.cpp
+@@ -17,6 +17,7 @@ static GstStaticPadTemplate sink_template = GST_STATIC_PAD_TEMPLATE(
+ static GstStaticPadTemplate src_template = GST_STATIC_PAD_TEMPLATE(
+     "src", GST_PAD_SRC, GST_PAD_ALWAYS, GST_STATIC_CAPS(DX_VIDEORAW_CAPS_STR));
+ 
++static GstClockTime gst_dxinputselector_get_next_time(GstAggregator *agg);
+ static GstFlowReturn gst_dxinputselector_aggregate(GstAggregator *agg,
+                                                     gboolean timeout);
+ static gboolean gst_dxinputselector_sink_event(GstAggregator *agg,
+@@ -138,8 +139,40 @@ gst_dxinputselector_sink_event(GstAggregator *agg, GstAggregatorPad *pad,
+     }
+ }
+ 
++/* Deadline: running time of the earliest queued buffer; NONE while no pad
++ * has data, so the srcpad task sleeps.  Not gst_aggregator_simple_get_next_time():
++ * it uses the srcpad segment position, which this element never advances. */
++static GstClockTime gst_dxinputselector_get_next_time(GstAggregator *agg) {
++    GstClockTime best = GST_CLOCK_TIME_NONE;
++    gboolean have_buffer = FALSE;
++
++    GST_OBJECT_LOCK(agg);
++    for (GList *l = GST_ELEMENT(agg)->sinkpads; l; l = l->next) {
++        GstAggregatorPad *pad = GST_AGGREGATOR_PAD(l->data);
++        GstBuffer *buf = gst_aggregator_pad_peek_buffer(pad);
++        if (!buf)
++            continue;
++        have_buffer = TRUE;
++        GstClockTime pts = GST_BUFFER_PTS(buf);
++        if (GST_CLOCK_TIME_IS_VALID(pts)) {
++            GstClockTime rt = gst_segment_to_running_time(
++                &pad->segment, GST_FORMAT_TIME, pts);
++            if (GST_CLOCK_TIME_IS_VALID(rt) &&
++                (!GST_CLOCK_TIME_IS_VALID(best) || rt < best))
++                best = rt;
++        }
++        gst_buffer_unref(buf);
++    }
++    GST_OBJECT_UNLOCK(agg);
++
++    /* Buffers without a timestamp are aggregated immediately. */
++    if (have_buffer && !GST_CLOCK_TIME_IS_VALID(best))
++        return 0;
++    return best;
++}
++
+ static GstFlowReturn
+-gst_dxinputselector_aggregate(GstAggregator *agg, gboolean /*timeout*/) {
++gst_dxinputselector_aggregate(GstAggregator *agg, gboolean timeout) {
+     GstDxInputSelector *self = GST_DXINPUTSELECTOR(agg);
+ 
+     GstClockTime min_pts = GST_CLOCK_TIME_NONE;
+@@ -168,6 +201,9 @@ gst_dxinputselector_aggregate(GstAggregator *agg, gboolean /*timeout*/) {
+         all_done = FALSE;
+         GstBuffer *buf = gst_aggregator_pad_peek_buffer(pad);
+         if (!buf) {
++            /* Live deadline passed: skip this pad for this round instead of
++             * blocking the others.  Never taken with non-live upstream. */
++            if (timeout) continue;
+             GST_OBJECT_UNLOCK(agg);
+             for (auto &p : peeked) gst_buffer_unref(p.second);
+             return GST_AGGREGATOR_FLOW_NEED_DATA;
+@@ -268,6 +304,9 @@ static void gst_dxinputselector_class_init(GstDxInputSelectorClass *klass) {
+     agg_class->stop = GST_DEBUG_FUNCPTR(gst_dxinputselector_stop);
+     agg_class->src_query = GST_DEBUG_FUNCPTR(gst_dxinputselector_src_query);
+     agg_class->sink_query = GST_DEBUG_FUNCPTR(gst_dxinputselector_sink_query);
++    /* Without it `timeout` is never set and `latency` has no effect. */
++    agg_class->get_next_time =
++        GST_DEBUG_FUNCPTR(gst_dxinputselector_get_next_time);
+ }
+ 
+ static void gst_dxinputselector_init(GstDxInputSelector *self) {
+-- 
+2.43.0
+

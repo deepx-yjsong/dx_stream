@@ -1,0 +1,136 @@
+From 7ec6f8585d705346098f4fe36d59d797723930f5 Mon Sep 17 00:00:00 2001
+From: deepx-yjsong <yjsong@deepx.ai>
+Date: Wed, 30 Sep 2026 11:03:46 +0900
+Subject: [PATCH 08/10] fix(transforms): refuse a source buffer smaller than
+ its frame layout
+
+GstSrcFrame mapped the buffer and pointed the planes into it without checking
+that the mapping is as large as the layout it was given. A buffer labelled
+with a larger size than it holds was read past its end (dxpreprocess crashed
+in libyuv scaling). Refuse it the way gst_video_frame_map() does; the
+preprocessor skips the frame with a warning.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ .../src/preprocessors/preprocessor.cpp        |  4 +-
+ .../src/transforms/gst_frame_desc.hpp         | 20 ++++++-
+ .../test_dxpreprocess_short_buffer.cpp        | 60 +++++++++++++++++++
+ 3 files changed, 80 insertions(+), 4 deletions(-)
+ create mode 100644 test/base/element/inference/test_dxpreprocess_short_buffer.cpp
+
+diff --git a/gst-dxstream-plugin/src/preprocessors/preprocessor.cpp b/gst-dxstream-plugin/src/preprocessors/preprocessor.cpp
+index f562fd4..7dd961f 100644
+--- a/gst-dxstream-plugin/src/preprocessors/preprocessor.cpp
++++ b/gst-dxstream-plugin/src/preprocessors/preprocessor.cpp
+@@ -72,7 +72,9 @@ bool Preprocessor::preprocess(GstBuffer*   buf,
+     dxt::GstSrcFrame src(buf, frame_meta->_width, frame_meta->_height,
+                           src_fmt, vinfo_ptr);
+     if (!src.ok()) {
+-        GST_ERROR_OBJECT(element, "Preprocessor: failed to map GstBuffer");
++        GST_WARNING_OBJECT(element, "Preprocessor: cannot map stream %d buffer "
++                           "as %dx%d, skipping it", frame_meta->_stream_id,
++                           frame_meta->_width, frame_meta->_height);
+         return false;
+     }
+ 
+diff --git a/gst-dxstream-plugin/src/transforms/gst_frame_desc.hpp b/gst-dxstream-plugin/src/transforms/gst_frame_desc.hpp
+index 15102d5..03d88c8 100644
+--- a/gst-dxstream-plugin/src/transforms/gst_frame_desc.hpp
++++ b/gst-dxstream-plugin/src/transforms/gst_frame_desc.hpp
+@@ -304,10 +304,24 @@ public:
+ private:
+     void do_map() {
+         map_ = GST_MAP_INFO_INIT;
+-        if (gst_buffer_map(buf_, &map_, GST_MAP_READ)) {
+-            mapped_ = true;
+-            detail::fill_data_pointers(desc_, map_.data);
++        if (!gst_buffer_map(buf_, &map_, GST_MAP_READ))
++            return;
++        /* Refuse a buffer smaller than the layout, as gst_video_frame_map()
++         * does, rather than read past it. */
++        size_t need = 0;
++        for (int i = 0; i < desc_.num_planes; ++i)
++            need = std::max(need, desc_.planes[i].offset +
++                                      static_cast<size_t>(desc_.planes[i].stride) *
++                                          desc_.planes[i].height);
++        if (map_.size < need) {
++            GST_WARNING("buffer of %" G_GSIZE_FORMAT " bytes is smaller than a "
++                        "%dx%d frame (%" G_GSIZE_FORMAT " bytes)",
++                        map_.size, desc_.width, desc_.height, need);
++            gst_buffer_unmap(buf_, &map_);
++            return;
+         }
++        mapped_ = true;
++        detail::fill_data_pointers(desc_, map_.data);
+     }
+ 
+     GstBuffer* buf_;
+diff --git a/test/base/element/inference/test_dxpreprocess_short_buffer.cpp b/test/base/element/inference/test_dxpreprocess_short_buffer.cpp
+new file mode 100644
+index 0000000..5d1a4e2
+--- /dev/null
++++ b/test/base/element/inference/test_dxpreprocess_short_buffer.cpp
+@@ -0,0 +1,60 @@
++// dxpreprocess — a buffer smaller than its frame size is skipped, not read past
++// Whatever mislabels it upstream, the element must not read beyond the memory
++// it maps (gst_video_frame_map() refuses such a buffer the same way).
++
++#include <gst/check/gstcheck.h>
++#include <gst/check/gstharness.h>
++#include <gst/gst.h>
++#include "gst-dxpreprocess.hpp"
++#include "meta_helpers.hpp"
++
++static GstBuffer *rgb_buffer(int w, int h, int stream_id, int meta_w, int meta_h) {
++    gsize sz = (gsize)w * h * 3;
++    GstBuffer *b = gst_buffer_new_allocate(nullptr, sz, nullptr);
++    gst_buffer_memset(b, 0, 0x80, sz);
++    GST_BUFFER_PTS(b) = 0;
++    dxtest::make_frame_meta(b, stream_id, meta_w, meta_h);
++    return b;
++}
++
++static bool has_tensor(GstBuffer *b, int preproc_id) {
++    DXFrameMeta *fm = dx_get_frame_meta(b);
++    return fm && fm->_input_tensors.count(preproc_id) > 0;
++}
++
++GST_START_TEST(short_buffer_is_skipped) {
++    GstElement *e = gst_element_factory_make("dxpreprocess", nullptr);
++    g_object_set(e, "resize-width", 32u, "resize-height", 32u, "preprocess-id", 7u, nullptr);
++    GstHarness *h = gst_harness_new_with_element(e, "sink", "src");
++    gst_harness_set_src_caps_str(
++        h, "video/x-raw,format=RGB,width=64,height=64,framerate=30/1");
++
++    // Well-formed: 64x64 data labelled 64x64.
++    gst_harness_push(h, rgb_buffer(64, 64, 0, 64, 64));
++    GstBuffer *out = gst_harness_try_pull(h);
++    fail_unless(out != nullptr);
++    fail_unless(has_tensor(out, 7), "a well-formed frame must be preprocessed");
++    gst_buffer_unref(out);
++
++    // 4x4 data labelled 64x64: dropped or passed on, never read as 64x64.
++    gst_harness_push(h, rgb_buffer(4, 4, 0, 64, 64));
++    out = gst_harness_try_pull(h);
++    if (out) {
++        fail_if(has_tensor(out, 7), "a short buffer was preprocessed as a full frame");
++        gst_buffer_unref(out);
++    }
++
++    gst_harness_teardown(h);
++    gst_object_unref(e);
++}
++GST_END_TEST;
++
++static Suite *dxpreprocess_short_buffer_suite(void) {
++    Suite *s = suite_create("dxpreprocess_short_buffer");
++    TCase *tc = tcase_create("contract");
++    suite_add_tcase(s, tc);
++    tcase_add_test(tc, short_buffer_is_skipped);
++    return s;
++}
++
++GST_CHECK_MAIN(dxpreprocess_short_buffer);
+-- 
+2.43.0
+

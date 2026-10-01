@@ -1,0 +1,1480 @@
+From b1a2cd8c0315f5d87d055b5dcb549aa6d6f95009 Mon Sep 17 00:00:00 2001
+From: deepx-yjsong <yjsong@deepx.ai>
+Date: Tue, 29 Sep 2026 11:30:30 +0900
+Subject: [PATCH 1/3] feat(msgconv,inputselector,msgbroker): identify the
+ source and its capture time in each message
+
+A message says which pad a frame came through, but not which source that is,
+which node produced it, or when the frame was captured. With sources added
+and removed at runtime, or several nodes publishing to one broker, a
+consumer cannot tell messages apart or place them in time.
+
+Source identity
+  - dxinputselector sink pads get a "sensor-id" property (mutable in
+    PLAYING), set on each frame as DXFrameMeta._sensor_id. Unlike the pad
+    index it is not handed to the next source. Set it before linking and
+    the first frame carries it.
+  - dxmsgconv "node-id" names the producing node.
+
+Capture time
+  - dxmsgconv reads the buffer's GstReferenceTimestampMeta, but only the
+    wall-clock references: timestamp/x-unix, and timestamp/x-ntp (as rtspsrc
+    attaches), converted to the Unix epoch. Other references (e.g. PTP) are
+    not UTC and are ignored.
+  - The buffer PTS is passed as well.
+
+Message key
+  - dxmsgconv sets the source's sensor id as the key on GstDxMsgMeta, and
+    the Kafka adapter sends it, so one source's messages stay in order on
+    one partition. No sensor id, no key: unchanged round-robin. MQTT
+    ignores it.
+
+Wire format
+  - dxmsgconv "payload-type" (enum: json, protobuf; default json).
+  - dx_msgconvl emits protobuf dxstream.SensorFrame
+    (dx_msgconvl/proto/dx_frame.proto), the same fields as the JSON.
+    capture_time is a google.protobuf.Timestamp, as in the NVIDIA Metropolis
+    schema. No proto3 `optional`, so protoc 3.6+ builds it.
+  - New JSON keys (sensorId, nodeId, ptsNs, captureTime) use the proto3 JSON
+    names of the same fields; captureTime is RFC 3339 UTC. Existing keys are
+    unchanged, and the new ones are omitted when unset.
+  - The protobuf backend is optional (-Dprotobuf=auto|enabled|disabled).
+    Without it the library builds as before, and protobuf requested at
+    runtime fails with an install hint.
+
+Compatibility with existing custom libraries
+  - New fields are appended to GstDxMsgMetaInfo and DXFrameMeta, so a
+    library built against the old headers still reads its fields at the
+    same offsets.
+  - DxMsgPayload and DxMsgContext, which libraries allocate, are unchanged.
+    The key lives on GstDxMsgMeta, which the element owns.
+
+Tests
+  - test_dxmsgconv_identity: sensorId/nodeId, the message key, capture time
+    from x-ntp and x-unix, a PTP reference ignored.
+  - test_dxinputselector: pad sensor-id stamping.
+  - test_dxmsgconv: ptsNs.
+  - test_dxframemeta: _sensor_id copy.
+  - dx_msgconvl test_protobuf_convert: round trip, with and without times.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ .../docs/Appendix_Build_on_OrangePi5Plus.md   |   6 +-
+ docs/source/docs/Appendix_Build_on_Windows.md |   6 +-
+ .../dx_msgconvl/dx_msgconvl.cpp               |  20 ++-
+ .../dx_msgconvl/dx_msgconvl_priv.cpp          | 122 ++++++++++++++
+ .../dx_msgconvl/dx_msgconvl_priv.hpp          |   7 +
+ .../dx_msgconvl/meson.build                   |  57 ++++++-
+ .../dx_msgconvl/meson_options.txt             |   7 +
+ .../dx_msgconvl/proto/dx_frame.proto          |  43 +++++
+ .../tests/test_protobuf_convert.cpp           |  75 +++++++++
+ .../metadata/gst-dxframemeta.cpp              |   3 +
+ .../metadata/gst-dxframemeta.hpp              |   4 +
+ .../metadata/gst-dxmsgmeta.cpp                |  18 ++
+ .../metadata/gst-dxmsgmeta.hpp                |  18 ++
+ .../src/brokers/dx_msgbrokerl_kafka.cpp       |  21 ++-
+ .../src/brokers/dx_msgbrokerl_kafka.hpp       |   1 +
+ .../src/brokers/dx_msgbrokerl_mqtt.cpp        |   2 +
+ .../src/brokers/dx_msgbrokerl_mqtt.hpp        |   1 +
+ .../src/gst-dxinputselector.cpp               |  69 +++++++-
+ .../src/gst-dxinputselector.hpp               |  11 ++
+ gst-dxstream-plugin/src/gst-dxmsgbroker.cpp   |   1 +
+ gst-dxstream-plugin/src/gst-dxmsgbroker.hpp   |   1 +
+ gst-dxstream-plugin/src/gst-dxmsgconv.cpp     |  73 +++++++-
+ gst-dxstream-plugin/src/gst-dxmsgconv.hpp     |   2 +
+ install.bat                                   |   4 +
+ scripts/setup/06_communication.sh             |   4 +
+ .../test_dxmsgbroker_failure_streak.cpp       |   2 +-
+ .../base/element/messaging/test_dxmsgconv.cpp |  36 ++++
+ .../messaging/test_dxmsgconv_identity.cpp     | 158 ++++++++++++++++++
+ .../multistream/test_dxinputselector.cpp      |  49 ++++++
+ test/base/metadata/test_dxframemeta.cpp       |  17 ++
+ vcpkg.json                                    |   3 +-
+ 31 files changed, 820 insertions(+), 21 deletions(-)
+ create mode 100644 dx_stream/custom_library/message_convert_library/dx_msgconvl/meson_options.txt
+ create mode 100644 dx_stream/custom_library/message_convert_library/dx_msgconvl/proto/dx_frame.proto
+ create mode 100644 dx_stream/custom_library/message_convert_library/dx_msgconvl/tests/test_protobuf_convert.cpp
+ create mode 100644 test/base/element/messaging/test_dxmsgconv_identity.cpp
+
+diff --git a/docs/source/docs/Appendix_Build_on_OrangePi5Plus.md b/docs/source/docs/Appendix_Build_on_OrangePi5Plus.md
+index 8a38447..750c16f 100644
+--- a/docs/source/docs/Appendix_Build_on_OrangePi5Plus.md
++++ b/docs/source/docs/Appendix_Build_on_OrangePi5Plus.md
+@@ -216,7 +216,8 @@ The Orange Pi 5 Plus Ubuntu image includes pre-configured GStreamer packages wit
+ sudo apt-get update
+ sudo apt install -y python3-pip ninja-build
+ sudo pip install meson
+-sudo apt-get install -y libeigen3-dev libjson-glib-dev librdkafka-dev libmosquitto-dev libyuv-dev
++sudo apt-get install -y libeigen3-dev libjson-glib-dev librdkafka-dev libmosquitto-dev libyuv-dev \
++                        libprotobuf-dev protobuf-compiler
+ ```
+ 
+ **Package Descriptions**  
+@@ -227,6 +228,9 @@ sudo apt-get install -y libeigen3-dev libjson-glib-dev librdkafka-dev libmosquit
+ - `librdkafka-dev`: Apache Kafka client library  
+ - `libmosquitto-dev`: MQTT broker client library  
+ - `libyuv-dev`: YUV color space conversion library  
++- `libprotobuf-dev`, `protobuf-compiler`: Protocol Buffers runtime and `protoc`. **Optional** —
++  they enable the `dx_msgconvl` protobuf payload backend (`payload-type=protobuf`). If absent, meson
++  auto-disables that backend and the JSON payload still builds  
+ 
+ ### [Step 3.2] Cloning & Compiling DX-Stream
+ 
+diff --git a/docs/source/docs/Appendix_Build_on_Windows.md b/docs/source/docs/Appendix_Build_on_Windows.md
+index 16369f9..7daeeac 100644
+--- a/docs/source/docs/Appendix_Build_on_Windows.md
++++ b/docs/source/docs/Appendix_Build_on_Windows.md
+@@ -120,7 +120,7 @@ This automatically:
+ - Step 1. Verifies all prerequisites are present  
+ - Step 2. Installs `meson` and `ninja` via pip  
+ - Step 3. Clones and bootstraps vcpkg (if not present)  
+-- Step 4. Installs C++ libraries via vcpkg: eigen3, opencv4, libyuv, mosquitto, librdkafka  
++- Step 4. Installs C++ libraries via vcpkg: eigen3, opencv4, libyuv, mosquitto, librdkafka, protobuf  
+ - Step 5. Generates `opencv4.pc` (required for meson to find OpenCV)  
+ - Step 6. Validates DEEPX_SDK_DIR path  
+ 
+@@ -129,9 +129,9 @@ This automatically:
+ On an internet-connected machine. 
+ ```cmd
+ C:\vcpkg\vcpkg install eigen3:x64-windows opencv4:x64-windows libyuv:x64-windows ^
+-                       mosquitto:x64-windows librdkafka:x64-windows
++                       mosquitto:x64-windows librdkafka:x64-windows protobuf:x64-windows
+ C:\vcpkg\vcpkg export eigen3:x64-windows opencv4:x64-windows libyuv:x64-windows ^
+-                       mosquitto:x64-windows librdkafka:x64-windows --zip
++                       mosquitto:x64-windows librdkafka:x64-windows protobuf:x64-windows --zip
+ ```
+ 
+ Copy the resulting zip to the air-gapped machine, extract `installed/x64-windows/` to:
+diff --git a/dx_stream/custom_library/message_convert_library/dx_msgconvl/dx_msgconvl.cpp b/dx_stream/custom_library/message_convert_library/dx_msgconvl/dx_msgconvl.cpp
+index 535320d..47a3f71 100644
+--- a/dx_stream/custom_library/message_convert_library/dx_msgconvl/dx_msgconvl.cpp
++++ b/dx_stream/custom_library/message_convert_library/dx_msgconvl/dx_msgconvl.cpp
+@@ -28,8 +28,26 @@ DX_CUSTOM_EXPORT DxMsgPayload *dxmsg_convert_payload(DxMsgContext *context,
+         return nullptr;
+     }
+ 
+-    gchar *json_data = dxpayload_convert_to_json(context, meta_info);
++    if (meta_info->_payload_type == DX_PAYLOAD_TYPE_PROTOBUF) {
++        size_t pb_size = 0;
++        void *pb_data = dxpayload_convert_to_protobuf(context, meta_info, &pb_size);
++        if (!pb_data) {
++            g_warning("dxpayload_convert_to_protobuf returned null");
++        g_free(payload);
++            return nullptr;
++        }
++        if (pb_size > G_MAXUINT) {
++            g_warning("Protobuf data size (%zu bytes) exceeds maximum guint value", pb_size);
++            g_free(pb_data);
++        g_free(payload);
++            return nullptr;
++        }
++        payload->_size = (guint)pb_size;
++        payload->_data = pb_data;
++        return payload;
++    }
+ 
++    gchar *json_data = dxpayload_convert_to_json(context, meta_info);
+     if (json_data == nullptr) {
+         g_warning("dxpayload_convert_to_json returned null");
+         g_free(payload);
+diff --git a/dx_stream/custom_library/message_convert_library/dx_msgconvl/dx_msgconvl_priv.cpp b/dx_stream/custom_library/message_convert_library/dx_msgconvl/dx_msgconvl_priv.cpp
+index 8f4c97c..04a8871 100644
+--- a/dx_stream/custom_library/message_convert_library/dx_msgconvl/dx_msgconvl_priv.cpp
++++ b/dx_stream/custom_library/message_convert_library/dx_msgconvl/dx_msgconvl_priv.cpp
+@@ -6,6 +6,10 @@
+ #include "gstdxstream/gst-dxframemeta.hpp"
+ #include "gstdxstream/gst-dxobjectmeta.hpp"
+ 
++#ifdef DX_MSGCONVL_WITH_PROTOBUF
++#include "dx_frame.pb.h"
++#endif
++
+ DxMsgContextPriv *dxcontext_create_contextPriv(void) {
+     auto *contextPriv = g_new0(DxMsgContextPriv, 1);
+     return contextPriv;
+@@ -146,6 +150,18 @@ static void add_object_meta_to_json(JsonArray *jarray_objects,
+     json_array_add_element(jarray_objects, jnode_object);
+ }
+ 
++/* UTC time as RFC 3339 with nanoseconds, the proto3 JSON form of
++ * google.protobuf.Timestamp. */
++static gchar *format_rfc3339(GstClockTime unix_ns) {
++    GDateTime *dt = g_date_time_new_from_unix_utc((gint64)(unix_ns / GST_SECOND));
++    gchar *date = g_date_time_format(dt, "%Y-%m-%dT%H:%M:%S");
++    gchar *out = g_strdup_printf("%s.%09" G_GUINT64_FORMAT "Z", date,
++                                 (guint64)(unix_ns % GST_SECOND));
++    g_free(date);
++    g_date_time_unref(dt);
++    return out;
++}
++
+ /*
+  * Sample JSON Output Format:
+  * {
+@@ -153,6 +169,10 @@ static void add_object_meta_to_json(JsonArray *jarray_objects,
+  *   "seqId": 123,
+  *   "width": 1920,
+  *   "height": 1080,
++ *   "sensorId": "cam01",
++ *   "nodeId": "node-01",
++ *   "ptsNs": 1234567890,
++ *   "captureTime": "2026-09-29T01:02:03.456789012Z",
+  *   "objects": [
+  *     {
+  *       "object": {
+@@ -219,6 +239,24 @@ gchar *dxpayload_convert_to_json(DxMsgContext *context,
+     json_object_set_int_member(jobj_root, "width", frame_meta->_width);
+     json_object_set_int_member(jobj_root, "height", frame_meta->_height);
+ 
++    // Optional fields are omitted when unset. Names follow the proto3 JSON
++    // names of the same SensorFrame fields.
++    if (!frame_meta->_sensor_id.empty()) {
++        json_object_set_string_member(jobj_root, "sensorId",
++                                      frame_meta->_sensor_id.c_str());
++    }
++    if (meta_info->_node_id && meta_info->_node_id[0] != '\0') {
++        json_object_set_string_member(jobj_root, "nodeId", meta_info->_node_id);
++    }
++    if (GST_CLOCK_TIME_IS_VALID(meta_info->_pts)) {
++        json_object_set_int_member(jobj_root, "ptsNs", (gint64)meta_info->_pts);
++    }
++    if (GST_CLOCK_TIME_IS_VALID(meta_info->_capture_time)) {
++        gchar *rfc3339 = format_rfc3339(meta_info->_capture_time);
++        json_object_set_string_member(jobj_root, "captureTime", rfc3339);
++        g_free(rfc3339);
++    }
++
+     if (meta_info->_frame_base64) {
+         json_object_set_string_member(jobj_root, "frameData",
+                                       meta_info->_frame_base64);
+@@ -239,3 +277,87 @@ gchar *dxpayload_convert_to_json(DxMsgContext *context,
+ 
+     return json_data;
+ }
++
++#ifndef DX_MSGCONVL_WITH_PROTOBUF
++
++// Built without the protobuf backend. Keep the symbol so dx_msgconvl.cpp links
++// unchanged, and fail loudly instead of silently emitting nothing: the caller
++// treats nullptr as "conversion failed" and drops the buffer.
++void *dxpayload_convert_to_protobuf(DxMsgContext *context,
++                                    GstDxMsgMetaInfo *meta_info,
++                                    size_t *out_size) {
++    std::ignore = context;
++    std::ignore = meta_info;
++    std::ignore = out_size;
++    g_warning("payload-type=protobuf requested but dx_msgconvl was built "
++              "without protobuf support. Install libprotobuf-dev and "
++              "protobuf-compiler, then reconfigure with -Dprotobuf=enabled.");
++    return nullptr;
++}
++
++#else
++
++void *dxpayload_convert_to_protobuf(DxMsgContext *context,
++                                    GstDxMsgMetaInfo *meta_info,
++                                    size_t *out_size) {
++    std::ignore = context;
++    const auto *frame_meta = (DXFrameMeta *)(meta_info->_frame_meta);
++
++    dxstream::SensorFrame frame;
++    frame.set_sensor_id(frame_meta->_sensor_id);
++    if (meta_info->_node_id && meta_info->_node_id[0] != '\0') {
++        frame.set_node_id(meta_info->_node_id);
++    }
++    frame.set_stream_id(frame_meta->_stream_id);
++    frame.set_seq_id(meta_info->_seq_id);
++    frame.set_width(frame_meta->_width);
++    frame.set_height(frame_meta->_height);
++    frame.set_pts_ns(GST_CLOCK_TIME_IS_VALID(meta_info->_pts)
++                         ? (gint64)meta_info->_pts : -1);
++    if (GST_CLOCK_TIME_IS_VALID(meta_info->_capture_time)) {
++        auto *t = frame.mutable_capture_time();
++        t->set_seconds((gint64)(meta_info->_capture_time / GST_SECOND));
++        t->set_nanos((gint32)(meta_info->_capture_time % GST_SECOND));
++    }
++
++    for (const auto obj_meta : frame_meta->_object_meta_list) {
++        if (obj_meta->_label == -1) {
++            continue;
++        }
++        dxstream::Detection *det = frame.add_objects();
++        det->set_label_id(obj_meta->_label);
++        det->set_track_id(obj_meta->_track_id);
++        det->set_confidence(obj_meta->_confidence);
++        det->set_name(obj_meta->_label_name);
++        dxstream::BBox *box = det->mutable_box();
++        box->set_start_x(obj_meta->_box[0]);
++        box->set_start_y(obj_meta->_box[1]);
++        box->set_end_x(obj_meta->_box[2]);
++        box->set_end_y(obj_meta->_box[3]);
++        if (!obj_meta->_keypoints.empty()) {
++            size_t n = obj_meta->_keypoints.size() / 3;
++            for (size_t k = 0; k < n; ++k) {
++                dxstream::Keypoint *kp = det->add_keypoints();
++                kp->set_x(obj_meta->_keypoints[k * 3 + 0]);
++                kp->set_y(obj_meta->_keypoints[k * 3 + 1]);
++                kp->set_score(obj_meta->_keypoints[k * 3 + 2]);
++            }
++        }
++    }
++
++    size_t size = frame.ByteSizeLong();
++    // g_malloc(0) returns NULL, and the caller reads NULL as "conversion
++    // failed" and drops the buffer. A frame whose every field happens to hold
++    // the proto3 default serializes to zero bytes, so allocate at least one
++    // byte to keep an empty-but-valid message distinguishable from an error.
++    void *buf = g_malloc(size ? size : 1);
++    if (!frame.SerializeToArray(buf, (int)size)) {
++        g_warning("SensorFrame SerializeToArray failed (size=%zu)", size);
++        g_free(buf);
++        return nullptr;
++    }
++    *out_size = size;
++    return buf;
++}
++
++#endif  // DX_MSGCONVL_WITH_PROTOBUF
+diff --git a/dx_stream/custom_library/message_convert_library/dx_msgconvl/dx_msgconvl_priv.hpp b/dx_stream/custom_library/message_convert_library/dx_msgconvl/dx_msgconvl_priv.hpp
+index 532557d..e513418 100644
+--- a/dx_stream/custom_library/message_convert_library/dx_msgconvl/dx_msgconvl_priv.hpp
++++ b/dx_stream/custom_library/message_convert_library/dx_msgconvl/dx_msgconvl_priv.hpp
+@@ -22,4 +22,11 @@ bool dxcontext_parse_json_config(const gchar *file,
+ gchar *dxpayload_convert_to_json(DxMsgContext *context,
+                                  GstDxMsgMetaInfo *meta_info);
+ 
++// Serialize the frame meta as a dxstream.SensorFrame protobuf message.
++// Returns a g_malloc'd buffer of *out_size bytes (caller frees with g_free),
++// or nullptr on failure. Bytes are NOT null-terminated.
++void *dxpayload_convert_to_protobuf(DxMsgContext *context,
++                                    GstDxMsgMetaInfo *meta_info,
++                                    size_t *out_size);
++
+ #endif /* __DX_MSGCONVL_PRIV_H__ */
+\ No newline at end of file
+diff --git a/dx_stream/custom_library/message_convert_library/dx_msgconvl/meson.build b/dx_stream/custom_library/message_convert_library/dx_msgconvl/meson.build
+index 23026cb..36fa96f 100644
+--- a/dx_stream/custom_library/message_convert_library/dx_msgconvl/meson.build
++++ b/dx_stream/custom_library/message_convert_library/dx_msgconvl/meson.build
+@@ -2,6 +2,10 @@ project('dx_stream_dx_msgconvl', 'cpp', version : '1.0.0', license : 'LGPL', def
+ 
+ opencv_dep = dependency('opencv4', required: true)
+ json_glib_dep = dependency('json-glib-1.0', version : '>= 1.0')
++# Protobuf backend is optional: JSON (the default payload-type) must keep
++# building on a machine that has no protobuf installed.
++protobuf_opt = get_option('protobuf')
++protobuf_dep = dependency('protobuf', required: protobuf_opt)
+ 
+ gst_dep = dependency('gstreamer-1.0', version : '>=1.16.3',
+     required : true, fallback : ['gstreamer', 'gst_dep'])
+@@ -9,12 +13,53 @@ gst_dep = dependency('gstreamer-1.0', version : '>=1.16.3',
+ dx_stream_dep = dependency('gstdxstream')
+ dxrt_dep = declare_dependency(link_args: ['-ldxrt'])
+ 
+-dx_msgconvl_lib = shared_library('dx_msgconvl', 
+-    [
+-    'dx_msgconvl.cpp',
+-    'dx_msgconvl_priv.cpp'
+-    ],
+-    dependencies : [gst_dep, opencv_dep, json_glib_dep, dx_stream_dep, dxrt_dep],
++protoc = find_program('protoc', required: protobuf_opt)
++
++with_protobuf = protobuf_dep.found() and protoc.found()
++
++lib_sources = ['dx_msgconvl.cpp', 'dx_msgconvl_priv.cpp']
++lib_deps = [gst_dep, opencv_dep, json_glib_dep, dx_stream_dep, dxrt_dep]
++lib_args = []
++
++if with_protobuf
++    proto_gen = custom_target('dx_frame_pb',
++        input : 'proto/dx_frame.proto',
++        output : ['dx_frame.pb.cc', 'dx_frame.pb.h'],
++        command : [protoc,
++                   '--proto_path=@CURRENT_SOURCE_DIR@/proto',
++                   '--cpp_out=@OUTDIR@',
++                   '@INPUT@'])
++    lib_sources += proto_gen
++    lib_deps += protobuf_dep
++    lib_args += '-DDX_MSGCONVL_WITH_PROTOBUF'
++    message('dx_msgconvl: protobuf payload backend ENABLED')
++else
++    message('dx_msgconvl: protobuf payload backend DISABLED ' +
++            '(payload-type=protobuf will be rejected at runtime; ' +
++            'install libprotobuf-dev + protobuf-compiler and reconfigure ' +
++            'with -Dprotobuf=enabled to build it)')
++endif
++
++dx_msgconvl_lib = shared_library('dx_msgconvl',
++    lib_sources,
++    cpp_args : lib_args,
++    dependencies : lib_deps,
+     install: true,
+     install_dir: get_option('datadir') / 'gstdxstream' / 'lib'
+ )
++
++# Host unit test (no NPU): protobuf serialization round-trip.
++# Only meaningful when the protobuf backend is actually built.
++if with_protobuf
++    test_protobuf_convert = executable('test_protobuf_convert',
++        [
++        'tests/test_protobuf_convert.cpp',
++        'dx_msgconvl_priv.cpp',
++        proto_gen
++        ],
++        cpp_args : lib_args,
++        dependencies : lib_deps,
++        install: false
++    )
++    test('protobuf_convert', test_protobuf_convert)
++endif
+diff --git a/dx_stream/custom_library/message_convert_library/dx_msgconvl/meson_options.txt b/dx_stream/custom_library/message_convert_library/dx_msgconvl/meson_options.txt
+new file mode 100644
+index 0000000..6b1a7c2
+--- /dev/null
++++ b/dx_stream/custom_library/message_convert_library/dx_msgconvl/meson_options.txt
+@@ -0,0 +1,7 @@
++option('protobuf',
++    type : 'feature',
++    value : 'auto',
++    description : 'Build the Protocol Buffers payload backend (payload-type=protobuf). ' +
++                  'Requires libprotobuf and protoc. With the default "auto" the ' +
++                  'backend is built only when both are present, so JSON-only users ' +
++                  'need no extra dependency.')
+diff --git a/dx_stream/custom_library/message_convert_library/dx_msgconvl/proto/dx_frame.proto b/dx_stream/custom_library/message_convert_library/dx_msgconvl/proto/dx_frame.proto
+new file mode 100644
+index 0000000..436a4af
+--- /dev/null
++++ b/dx_stream/custom_library/message_convert_library/dx_msgconvl/proto/dx_frame.proto
+@@ -0,0 +1,43 @@
++syntax = "proto3";
++
++package dxstream;
++
++import "google/protobuf/timestamp.proto";
++
++message BBox {
++  float start_x = 1;
++  float start_y = 2;
++  float end_x = 3;
++  float end_y = 4;
++}
++
++message Keypoint {
++  float x = 1;
++  float y = 2;
++  float score = 3;
++}
++
++message Detection {
++  int32 label_id = 1;
++  int32 track_id = 2;
++  float confidence = 3;
++  string name = 4;
++  BBox box = 5;
++  repeated Keypoint keypoints = 6;  // pose models only
++}
++
++// One frame's inference result: the protobuf form of the JSON payload.
++message SensorFrame {
++  string sensor_id = 1;   // dxinputselector pad "sensor-id"; empty if unset
++  string node_id = 2;     // dxmsgconv "node-id"; empty if unset
++  int32 stream_id = 3;    // dxinputselector pad index; reused by later sources
++  uint64 seq_id = 4;      // per-stream message counter
++  int32 width = 5;
++  int32 height = 6;
++  int64 pts_ns = 7;       // buffer PTS in ns; -1 if the buffer had none
++  reserved 8;             // retired; never reuse
++  repeated Detection objects = 9;
++  // Capture time (UTC) from the source's timestamp/x-ntp or timestamp/x-unix
++  // reference; unset if the source provides none.
++  google.protobuf.Timestamp capture_time = 10;
++}
+diff --git a/dx_stream/custom_library/message_convert_library/dx_msgconvl/tests/test_protobuf_convert.cpp b/dx_stream/custom_library/message_convert_library/dx_msgconvl/tests/test_protobuf_convert.cpp
+new file mode 100644
+index 0000000..71d9500
+--- /dev/null
++++ b/dx_stream/custom_library/message_convert_library/dx_msgconvl/tests/test_protobuf_convert.cpp
+@@ -0,0 +1,75 @@
++#include "dx_msgconvl_priv.hpp"
++#include "dx_frame.pb.h"
++#include "gstdxstream/gst-dxframemeta.hpp"
++#include "gstdxstream/gst-dxobjectmeta.hpp"
++
++#include <glib.h>
++#include <cassert>
++#include <cstdio>
++
++static dxstream::SensorFrame convert(GstDxMsgMetaInfo *info) {
++    DxMsgContext ctx{};
++    size_t size = 0;
++    void *buf = dxpayload_convert_to_protobuf(&ctx, info, &size);
++    assert(buf != nullptr);
++    dxstream::SensorFrame frame;
++    bool ok = frame.ParseFromArray(buf, (int)size);
++    assert(ok);
++    g_free(buf);
++    return frame;
++}
++
++int main() {
++    DXObjectMeta obj{};
++    obj._label = 1;
++    obj._track_id = 42;
++    obj._confidence = 0.87f;
++    obj._label_name = "person";
++    obj._box = {300.f, 400.f, 500.f, 600.f};
++
++    DXFrameMeta fm{};
++    fm._stream_id = 0;
++    fm._sensor_id = "cam01";
++    fm._width = 1920;
++    fm._height = 1080;
++    fm._object_meta_list.push_back(&obj);
++
++    GstDxMsgMetaInfo info{};
++    info._frame_meta = &fm;
++    info._seq_id = 123;
++    info._payload_type = DX_PAYLOAD_TYPE_PROTOBUF;
++    info._node_id = "node-01";
++    info._pts = 1234567890;
++    info._capture_time = 1790000000 * GST_SECOND + 456789012;
++
++    dxstream::SensorFrame frame = convert(&info);
++    assert(frame.sensor_id() == "cam01");
++    assert(frame.node_id() == "node-01");
++    assert(frame.stream_id() == 0);
++    assert(frame.seq_id() == 123u);
++    assert(frame.width() == 1920);
++    assert(frame.height() == 1080);
++    assert(frame.pts_ns() == 1234567890);
++    assert(frame.has_capture_time());
++    assert(frame.capture_time().seconds() == 1790000000);
++    assert(frame.capture_time().nanos() == 456789012);
++    assert(frame.objects_size() == 1);
++    const dxstream::Detection &d = frame.objects(0);
++    assert(d.label_id() == 1);
++    assert(d.track_id() == 42);
++    assert(d.name() == "person");
++    assert(d.box().start_x() == 300.f);
++    assert(d.box().start_y() == 400.f);
++    assert(d.box().end_x() == 500.f);
++    assert(d.box().end_y() == 600.f);
++
++    // Unknown times: no capture_time, PTS -1.
++    info._pts = GST_CLOCK_TIME_NONE;
++    info._capture_time = GST_CLOCK_TIME_NONE;
++    frame = convert(&info);
++    assert(!frame.has_capture_time());
++    assert(frame.pts_ns() == -1);
++
++    std::printf("PASS\n");
++    return 0;
++}
+diff --git a/gst-dxstream-plugin/metadata/gst-dxframemeta.cpp b/gst-dxstream-plugin/metadata/gst-dxframemeta.cpp
+index 1921089..5bb329c 100644
+--- a/gst-dxstream-plugin/metadata/gst-dxframemeta.cpp
++++ b/gst-dxstream-plugin/metadata/gst-dxframemeta.cpp
+@@ -88,6 +88,7 @@ static gboolean dx_frame_meta_init(GstMeta *meta, gpointer params,
+     // Initialize C++ objects with placement new
+     new (&dx_meta->_format) std::string();
+     new (&dx_meta->_name) std::string();
++    new (&dx_meta->_sensor_id) std::string();
+     new (&dx_meta->_object_meta_list) std::vector<DXObjectMeta*>();
+     new (&dx_meta->_frame_user_meta_list) std::vector<DXUserMeta*>();
+     new (&dx_meta->_input_tensors) std::map<int, dxs::DXTensors>();
+@@ -126,6 +127,7 @@ static void dx_frame_meta_free(GstMeta *meta, GstBuffer *buffer) {
+     // so destructors must be called explicitly before GStreamer frees the memory
+     dx_meta->_format.~basic_string(); // NOSONAR
+     dx_meta->_name.~basic_string(); // NOSONAR
++    dx_meta->_sensor_id.~basic_string(); // NOSONAR
+     dx_meta->_label_name.~basic_string(); // NOSONAR
+     dx_meta->_object_meta_list.~vector(); // NOSONAR
+     dx_meta->_frame_user_meta_list.~vector(); // NOSONAR
+@@ -152,6 +154,7 @@ void dx_frame_meta_copy(GstBuffer *src_buffer, DXFrameMeta *src_frame_meta,
+     GST_CAT_DEBUG_SAFE(dxmeta_cat, "Copying DXFrameMeta");
+ 
+     dst_frame_meta->_stream_id = src_frame_meta->_stream_id;
++    dst_frame_meta->_sensor_id = src_frame_meta->_sensor_id;
+     dst_frame_meta->_width = src_frame_meta->_width;
+     dst_frame_meta->_height = src_frame_meta->_height;
+     dst_frame_meta->_frame_rate = src_frame_meta->_frame_rate;
+diff --git a/gst-dxstream-plugin/metadata/gst-dxframemeta.hpp b/gst-dxstream-plugin/metadata/gst-dxframemeta.hpp
+index 7835a8d..0025703 100644
+--- a/gst-dxstream-plugin/metadata/gst-dxframemeta.hpp
++++ b/gst-dxstream-plugin/metadata/gst-dxframemeta.hpp
+@@ -50,6 +50,10 @@ struct _DXFrameMeta {
+     // RAII-managed tensors (shallow copy through shared_ptr)
+     std::map<int, dxs::DXTensors> _input_tensors;   // preproc_id -> input tensors
+     std::map<int, dxs::DXTensors> _output_tensors;   // infer_id -> output tensors
++
++    // Caller-assigned identity of the source; empty if unset. Unlike
++    // _stream_id (a pad index, reused), it names the source itself.
++    std::string _sensor_id;
+ };
+ 
+ DX_API GType dx_frame_meta_api_get_type(void);
+diff --git a/gst-dxstream-plugin/metadata/gst-dxmsgmeta.cpp b/gst-dxstream-plugin/metadata/gst-dxmsgmeta.cpp
+index db67472..904f978 100644
+--- a/gst-dxstream-plugin/metadata/gst-dxmsgmeta.cpp
++++ b/gst-dxstream-plugin/metadata/gst-dxmsgmeta.cpp
+@@ -4,6 +4,20 @@
+ 
+ GST_DEBUG_CATEGORY_EXTERN(dxmeta_cat);
+ 
++GType dx_payload_type_get_type(void) {
++    static gsize type_id_once = 0;
++    if (g_once_init_enter(&type_id_once)) {
++        static const GEnumValue values[] = {
++            {DX_PAYLOAD_TYPE_JSON, "JSON payload", "json"},
++            {DX_PAYLOAD_TYPE_PROTOBUF, "Protocol Buffers payload", "protobuf"},
++            {0, nullptr, nullptr},
++        };
++        GType type_id = g_enum_register_static("DxPayloadType", values);
++        g_once_init_leave(&type_id_once, type_id);
++    }
++    return (GType)type_id_once;
++}
++
+ #define GST_CAT_DEBUG_SAFE(cat, ...) \
+     G_STMT_START { \
+         if (cat) { \
+@@ -66,6 +80,7 @@ static gboolean gst_dxmsg_meta_init(GstMeta *meta, gpointer params,
+     GST_CAT_DEBUG_SAFE(dxmeta_cat, "Initializing GstDxMsgMeta");
+     auto *dxmsg_meta = (GstDxMsgMeta *)meta;
+     dxmsg_meta->_payload = nullptr;
++    dxmsg_meta->_key = nullptr;
+     return TRUE;
+ }
+ 
+@@ -82,6 +97,8 @@ static void gst_dxmsg_meta_free(GstMeta *meta, GstBuffer *buffer) {
+         g_free(payload);
+         payload = nullptr;
+     }
++    g_free(dxmsg_meta->_key);
++    dxmsg_meta->_key = nullptr;
+ }
+ 
+ // NOSONAR - GStreamer GstMetaTransformFunction signature requires non-const GstBuffer* parameters
+@@ -110,6 +127,7 @@ static gboolean gst_dxmsg_meta_transform(GstBuffer *dest, GstMeta *meta,
+     } else {
+         dst_msg_meta->_payload = nullptr;
+     }
++    dst_msg_meta->_key = g_strdup(src_msg_meta->_key);
+     return TRUE;
+ }
+ 
+diff --git a/gst-dxstream-plugin/metadata/gst-dxmsgmeta.hpp b/gst-dxstream-plugin/metadata/gst-dxmsgmeta.hpp
+index 63b107c..20d9237 100644
+--- a/gst-dxstream-plugin/metadata/gst-dxmsgmeta.hpp
++++ b/gst-dxstream-plugin/metadata/gst-dxmsgmeta.hpp
+@@ -10,6 +10,15 @@ G_BEGIN_DECLS
+ #define GST_DXMSG_META_API_TYPE (gst_dxmsg_meta_api_get_type())
+ #define GST_DXMSG_META_INFO (gst_dxmsg_meta_get_info())
+ 
++// Serialization format requested with dxmsgconv "payload-type".
++typedef enum {
++    DX_PAYLOAD_TYPE_JSON     = 0,
++    DX_PAYLOAD_TYPE_PROTOBUF = 1,
++} DxPayloadType;
++
++#define DX_TYPE_PAYLOAD_TYPE (dx_payload_type_get_type())
++DX_API GType dx_payload_type_get_type(void);
++
+ struct _DxMsgPayload {
+     gpointer _data;
+     guint _size;
+@@ -27,12 +36,21 @@ struct _GstDxMsgMetaInfo {
+     guint64 _seq_id;
+ 
+     const gchar *_frame_base64;
++
++    // Appended so that a convert library built against an older header
++    // still reads the fields above at the same offsets.
++    gint _payload_type;          // DxPayloadType
++    const gchar *_node_id;       // dxmsgconv "node-id"; nullptr if unset
++    GstClockTime _pts;           // buffer PTS; GST_CLOCK_TIME_NONE if unset
++    GstClockTime _capture_time;  // UTC, ns since the Unix epoch;
++                                 // GST_CLOCK_TIME_NONE if unknown
+ };
+ 
+ struct _GstDxMsgMeta {
+     GstMeta meta;
+ 
+     gpointer _payload;
++    gchar *_key;  // broker message key; nullptr for none
+ };
+ 
+ using DxMsgPayload = struct _DxMsgPayload;
+diff --git a/gst-dxstream-plugin/src/brokers/dx_msgbrokerl_kafka.cpp b/gst-dxstream-plugin/src/brokers/dx_msgbrokerl_kafka.cpp
+index fea0e9f..2ffd294 100755
+--- a/gst-dxstream-plugin/src/brokers/dx_msgbrokerl_kafka.cpp
++++ b/gst-dxstream-plugin/src/brokers/dx_msgbrokerl_kafka.cpp
+@@ -8,6 +8,7 @@
+ 
+ #include <algorithm>
+ #include <atomic>
++#include <cstring>
+ #include <fstream>
+ #include <map>
+ #include <sstream>
+@@ -279,6 +280,7 @@ DxMsg_Bal_Handle_t dxmsg_bal_connect_kafka(char *conn_info, char *cfg_path) {
+ }
+ 
+ DxMsg_Bal_Error_t dxmsg_bal_send_kafka(DxMsg_Bal_Handle_t handle, const char *topic,
++                                       const char *key,
+                                        const void *payload, int payload_len) {
+     auto *pClient = (KafkaClientInfo_t *)handle;
+     DxMsg_Bal_Error_t balError = DxMsg_Bal_Error::DXMSG_BAL_OK;
+@@ -291,11 +293,20 @@ DxMsg_Bal_Error_t dxmsg_bal_send_kafka(DxMsg_Bal_Handle_t handle, const char *to
+         return DxMsg_Bal_Error::DXMSG_BAL_ERR_INVALID;
+     }
+ 
+-    err = rd_kafka_producev(
+-        pClient->_rk, RD_KAFKA_V_TOPIC(topic),
+-        RD_KAFKA_V_MSGFLAGS(RD_KAFKA_MSG_F_COPY),
+-        RD_KAFKA_V_VALUE((void *)payload, payload_len),
+-        RD_KAFKA_V_OPAQUE(nullptr), RD_KAFKA_V_END);
++    if (key != nullptr && key[0] != '\0') {
++        err = rd_kafka_producev(
++            pClient->_rk, RD_KAFKA_V_TOPIC(topic),
++            RD_KAFKA_V_MSGFLAGS(RD_KAFKA_MSG_F_COPY),
++            RD_KAFKA_V_KEY(key, strlen(key)),
++            RD_KAFKA_V_VALUE((void *)payload, payload_len),
++            RD_KAFKA_V_OPAQUE(nullptr), RD_KAFKA_V_END);
++    } else {
++        err = rd_kafka_producev(
++            pClient->_rk, RD_KAFKA_V_TOPIC(topic),
++            RD_KAFKA_V_MSGFLAGS(RD_KAFKA_MSG_F_COPY),
++            RD_KAFKA_V_VALUE((void *)payload, payload_len),
++            RD_KAFKA_V_OPAQUE(nullptr), RD_KAFKA_V_END);
++    }
+     if (err) {
+         if (err == RD_KAFKA_RESP_ERR__QUEUE_FULL) {
+             GST_WARNING("Queue full, discarding message...");
+diff --git a/gst-dxstream-plugin/src/brokers/dx_msgbrokerl_kafka.hpp b/gst-dxstream-plugin/src/brokers/dx_msgbrokerl_kafka.hpp
+index b27a9f8..fe127c4 100755
+--- a/gst-dxstream-plugin/src/brokers/dx_msgbrokerl_kafka.hpp
++++ b/gst-dxstream-plugin/src/brokers/dx_msgbrokerl_kafka.hpp
+@@ -5,6 +5,7 @@
+ 
+ DxMsg_Bal_Handle_t dxmsg_bal_connect_kafka(char *conn_info, char *cfg_file);
+ DxMsg_Bal_Error_t dxmsg_bal_send_kafka(DxMsg_Bal_Handle_t handle, const char *topic,
++                                       const char *key,
+                                        const void *payload, int payload_len);
+ DxMsg_Bal_Error_t dxmsg_bal_disconnect_kafka(DxMsg_Bal_Handle_t handle);
+ 
+diff --git a/gst-dxstream-plugin/src/brokers/dx_msgbrokerl_mqtt.cpp b/gst-dxstream-plugin/src/brokers/dx_msgbrokerl_mqtt.cpp
+index 128fff1..0afc87f 100755
+--- a/gst-dxstream-plugin/src/brokers/dx_msgbrokerl_mqtt.cpp
++++ b/gst-dxstream-plugin/src/brokers/dx_msgbrokerl_mqtt.cpp
+@@ -312,7 +312,9 @@ DxMsg_Bal_Handle_t dxmsg_bal_connect_mqtt(char *conn_info, char *cfg_path) {
+ }
+ 
+ DxMsg_Bal_Error_t dxmsg_bal_send_mqtt(DxMsg_Bal_Handle_t handle, const char *topic,
++                                      const char *key,
+                                       const void *payload, int payload_len) {
++    std::ignore = key;  // MQTT does not use partition keys.
+     auto *pClient = (MqttClientInfo_t *)handle;
+     DxMsg_Bal_Error_t balError = DxMsg_Bal_Error::DXMSG_BAL_OK;
+     int rc;
+diff --git a/gst-dxstream-plugin/src/brokers/dx_msgbrokerl_mqtt.hpp b/gst-dxstream-plugin/src/brokers/dx_msgbrokerl_mqtt.hpp
+index 359bc1d..fedae99 100755
+--- a/gst-dxstream-plugin/src/brokers/dx_msgbrokerl_mqtt.hpp
++++ b/gst-dxstream-plugin/src/brokers/dx_msgbrokerl_mqtt.hpp
+@@ -5,6 +5,7 @@
+ 
+ DxMsg_Bal_Handle_t dxmsg_bal_connect_mqtt(char *conn_info, char *cfg_file);
+ DxMsg_Bal_Error_t dxmsg_bal_send_mqtt(DxMsg_Bal_Handle_t handle, const char *topic,
++                                      const char *key,
+                                       const void *payload, int payload_len);
+ DxMsg_Bal_Error_t dxmsg_bal_disconnect_mqtt(DxMsg_Bal_Handle_t handle);
+ 
+diff --git a/gst-dxstream-plugin/src/gst-dxinputselector.cpp b/gst-dxstream-plugin/src/gst-dxinputselector.cpp
+index 494ea71..2f871ab 100644
+--- a/gst-dxstream-plugin/src/gst-dxinputselector.cpp
++++ b/gst-dxstream-plugin/src/gst-dxinputselector.cpp
+@@ -73,6 +73,68 @@ static void send_wrapped_eos(GstAggregator *agg, gint stream_id) {
+     gst_pad_push_event(GST_AGGREGATOR_SRC_PAD(agg), wrapped);
+ }
+ 
++enum class PadPropertyID { PROP_0, PROP_SENSOR_ID };
++
++G_DEFINE_TYPE(GstDxInputSelectorPad, gst_dxinputselector_pad,
++              GST_TYPE_AGGREGATOR_PAD);
++
++static void gst_dxinputselector_pad_set_property(GObject *object, guint prop_id,
++                                                 const GValue *value,
++                                                 GParamSpec *pspec) {
++    auto *pad = GST_DXINPUTSELECTOR_PAD(object);
++    if (static_cast<PadPropertyID>(prop_id) == PadPropertyID::PROP_SENSOR_ID) {
++        g_mutex_lock(&pad->_sensor_id_lock);
++        g_free(pad->_sensor_id);
++        pad->_sensor_id = g_value_dup_string(value);
++        g_mutex_unlock(&pad->_sensor_id_lock);
++    } else {
++        G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
++    }
++}
++
++static void gst_dxinputselector_pad_get_property(GObject *object, guint prop_id,
++                                                 GValue *value,
++                                                 GParamSpec *pspec) {
++    auto *pad = GST_DXINPUTSELECTOR_PAD(object);
++    if (static_cast<PadPropertyID>(prop_id) == PadPropertyID::PROP_SENSOR_ID) {
++        g_mutex_lock(&pad->_sensor_id_lock);
++        g_value_set_string(value, pad->_sensor_id);
++        g_mutex_unlock(&pad->_sensor_id_lock);
++    } else {
++        G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
++    }
++}
++
++static void gst_dxinputselector_pad_finalize(GObject *object) {
++    auto *pad = GST_DXINPUTSELECTOR_PAD(object);
++    g_free(pad->_sensor_id);
++    g_mutex_clear(&pad->_sensor_id_lock);
++    G_OBJECT_CLASS(gst_dxinputselector_pad_parent_class)->finalize(object);
++}
++
++static void gst_dxinputselector_pad_class_init(GstDxInputSelectorPadClass *klass) {
++    auto *gobject_class = G_OBJECT_CLASS(klass);
++    gobject_class->set_property = gst_dxinputselector_pad_set_property;
++    gobject_class->get_property = gst_dxinputselector_pad_get_property;
++    gobject_class->finalize = gst_dxinputselector_pad_finalize;
++
++    g_object_class_install_property(
++        gobject_class, static_cast<guint>(PadPropertyID::PROP_SENSOR_ID),
++        g_param_spec_string(
++            "sensor-id", "Sensor ID",
++            "Identity of the source on this pad, set on its frames as "
++            "DXFrameMeta._sensor_id. Unlike the pad index it is not reused "
++            "for another source. (optional)",
++            nullptr,
++            (GParamFlags)(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS |
++                          GST_PARAM_MUTABLE_PLAYING)));
++}
++
++static void gst_dxinputselector_pad_init(GstDxInputSelectorPad *pad) {
++    pad->_sensor_id = nullptr;
++    g_mutex_init(&pad->_sensor_id_lock);
++}
++
+ static GstCaps *stream_caps(GstDxInputSelector *self, gint stream_id) {
+     GstCaps *caps = nullptr;
+     g_mutex_lock(&self->_stream_caps_lock);
+@@ -124,6 +186,11 @@ gst_dxinputselector_clip(GstAggregator *agg, GstAggregatorPad *pad,
+             return buf;
+         }
+         meta->_stream_id = get_sink_pad_index(GST_PAD(pad));
++        auto *dxpad = GST_DXINPUTSELECTOR_PAD(pad);
++        g_mutex_lock(&dxpad->_sensor_id_lock);
++        if (dxpad->_sensor_id)
++            meta->_sensor_id = dxpad->_sensor_id;
++        g_mutex_unlock(&dxpad->_sensor_id_lock);
+         /* Not gst_pad_get_current_caps(): clip() runs when a buffer is
+          * consumed, and a newer CAPS may already be stored on the pad while
+          * older buffers are still queued. */
+@@ -384,7 +451,7 @@ static void gst_dxinputselector_class_init(GstDxInputSelectorClass *klass) {
+         "Sangil Jo <sijo@deepx.ai>");
+ 
+     gst_element_class_add_static_pad_template_with_gtype(
+-        element_class, &sink_template, GST_TYPE_AGGREGATOR_PAD);
++        element_class, &sink_template, GST_TYPE_DXINPUTSELECTOR_PAD);
+     gst_element_class_add_static_pad_template(element_class, &src_template);
+ 
+     parent_class = GST_AGGREGATOR_CLASS(g_type_class_peek_parent(klass));
+diff --git a/gst-dxstream-plugin/src/gst-dxinputselector.hpp b/gst-dxstream-plugin/src/gst-dxinputselector.hpp
+index 97e874e..19f5ba6 100644
+--- a/gst-dxstream-plugin/src/gst-dxinputselector.hpp
++++ b/gst-dxstream-plugin/src/gst-dxinputselector.hpp
+@@ -12,6 +12,17 @@ G_BEGIN_DECLS
+ G_DECLARE_FINAL_TYPE(GstDxInputSelector, gst_dxinputselector, GST,
+                      DXINPUTSELECTOR, GstAggregator)
+ 
++/* Request sink pad; carries the per-source "sensor-id". */
++#define GST_TYPE_DXINPUTSELECTOR_PAD (gst_dxinputselector_pad_get_type())
++G_DECLARE_FINAL_TYPE(GstDxInputSelectorPad, gst_dxinputselector_pad, GST,
++                     DXINPUTSELECTOR_PAD, GstAggregatorPad)
++
++struct _GstDxInputSelectorPad {
++    GstAggregatorPad parent_instance;
++    gchar *_sensor_id;
++    GMutex _sensor_id_lock; /* leaf lock: clip() may run under the pad lock */
++};
++
+ struct _GstDxInputSelector {
+     GstAggregator parent_instance;
+     std::set<int> _stream_eos_sent;
+diff --git a/gst-dxstream-plugin/src/gst-dxmsgbroker.cpp b/gst-dxstream-plugin/src/gst-dxmsgbroker.cpp
+index a833167..7bb971a 100644
+--- a/gst-dxstream-plugin/src/gst-dxmsgbroker.cpp
++++ b/gst-dxstream-plugin/src/gst-dxmsgbroker.cpp
+@@ -330,6 +330,7 @@ static GstFlowReturn gst_dxmsgbroker_render(GstBaseSink *sink,
+         GST_LOG_OBJECT(self, "Publishing message (%u bytes) to topic: %s",
+                          payload->_size, topic);
+         DxMsg_Bal_Error_t error = self->_send_function(self->_handle, topic,
++                                     meta->_key,
+                                      payload->_data, payload->_size);
+         if (error != DxMsg_Bal_Error::DXMSG_BAL_OK) {
+             stats_inc(self, &self->_failed);
+diff --git a/gst-dxstream-plugin/src/gst-dxmsgbroker.hpp b/gst-dxstream-plugin/src/gst-dxmsgbroker.hpp
+index f7f46a7..c979221 100644
+--- a/gst-dxstream-plugin/src/gst-dxmsgbroker.hpp
++++ b/gst-dxstream-plugin/src/gst-dxmsgbroker.hpp
+@@ -32,6 +32,7 @@ using DxMsg_Bal_ConnectFptr_t = DxMsg_Bal_Handle_t (*)(char *conn_info,
+                                                         char *cfg_path);
+ using DxMsg_Bal_SendFptr_t = DxMsg_Bal_Error_t (*)(DxMsg_Bal_Handle_t handle,
+                                                     const char *topic,
++                                                    const char *key,
+                                                     const void *payload,
+                                                     int payload_len);
+ using DxMsg_Bal_DisconnectFptr_t = DxMsg_Bal_Error_t (*)(
+diff --git a/gst-dxstream-plugin/src/gst-dxmsgconv.cpp b/gst-dxstream-plugin/src/gst-dxmsgconv.cpp
+index 2a0d98a..71ee66a 100644
+--- a/gst-dxstream-plugin/src/gst-dxmsgconv.cpp
++++ b/gst-dxstream-plugin/src/gst-dxmsgconv.cpp
+@@ -16,7 +16,9 @@ enum class PropertyID {
+     PROP_CONFIG_FILE_PATH,
+     PROP_LIBRARY_FILE_PATH,
+     PROP_MESSAGE_INTERVAL,
+-    PROP_INCLUDE_FRAME
++    PROP_INCLUDE_FRAME,
++    PROP_NODE_ID,
++    PROP_PAYLOAD_TYPE
+ };
+ 
+ GST_DEBUG_CATEGORY_STATIC(gst_dxmsgconv_debug_category);
+@@ -54,6 +56,7 @@ static void gst_dxmsgconv_finalize(GObject *object) {
+ 
+     g_free(self->_config_file_path);
+     g_free(self->_library_file_path);
++    g_free(self->_node_id);
+ 
+     self->_kernel_pool.~unique_ptr();
+     self->_rgb_buf.~vector();
+@@ -133,6 +136,13 @@ static void gst_dxmsgconv_set_property(GObject *object, guint prop_id,
+     case PropertyID::PROP_INCLUDE_FRAME:
+         self->_include_frame = g_value_get_boolean(value);
+         break;
++    case PropertyID::PROP_NODE_ID:
++        g_free(self->_node_id);
++        self->_node_id = g_value_dup_string(value);
++        break;
++    case PropertyID::PROP_PAYLOAD_TYPE:
++        self->_payload_type = g_value_get_enum(value);
++        break;
+     default:
+         G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
+         break;
+@@ -157,6 +167,12 @@ static void gst_dxmsgconv_get_property(GObject *object, guint prop_id,
+     case PropertyID::PROP_INCLUDE_FRAME:
+         g_value_set_boolean(value, self->_include_frame);
+         break;
++    case PropertyID::PROP_NODE_ID:
++        g_value_set_string(value, self->_node_id);
++        break;
++    case PropertyID::PROP_PAYLOAD_TYPE:
++        g_value_set_enum(value, self->_payload_type);
++        break;
+     default:
+         G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
+         break;
+@@ -203,6 +219,21 @@ static void gst_dxmsgconv_class_init(GstDxMsgConvClass *klass) {
+             "Flag whether to include frame data as base64 JPEG in the message. (optional).",
+             FALSE, G_PARAM_READWRITE));
+ 
++    g_object_class_install_property(
++        gobject_class, static_cast<guint>(PropertyID::PROP_NODE_ID),
++        g_param_spec_string(
++            "node-id", "Node ID",
++            "Identifier of this node, emitted in each message. (optional).",
++            nullptr, G_PARAM_READWRITE));
++
++    g_object_class_install_property(
++        gobject_class, static_cast<guint>(PropertyID::PROP_PAYLOAD_TYPE),
++        g_param_spec_enum(
++            "payload-type", "Payload Type",
++            "Serialization format the custom convert library should emit. "
++            "(optional).",
++            DX_TYPE_PAYLOAD_TYPE, DX_PAYLOAD_TYPE_JSON, G_PARAM_READWRITE));
++
+     GstCaps *video_caps = gst_caps_from_string(
+         DX_VIDEORAW_CAPS_STR "; "
+         "video/x-raw, format=(string){ NV12, I420, RGB, BGR }");
+@@ -245,6 +276,8 @@ static void gst_dxmsgconv_init(GstDxMsgConv *self) {
+ 
+     self->_config_file_path = nullptr;
+     self->_library_file_path = nullptr;
++    self->_node_id = nullptr;
++    self->_payload_type = DX_PAYLOAD_TYPE_JSON;
+     self->_library_handle = nullptr;
+     self->_message_interval = 1;
+     self->_include_frame = FALSE;
+@@ -404,18 +437,48 @@ static void ensure_kernel_pool(GstDxMsgConv *self) {
+     GST_INFO_OBJECT(self, "include-frame: kernel pool created for RGB conversion");
+ }
+ 
++/* Seconds from the NTP epoch (1900) to the Unix epoch (1970). */
++#define NTP_TO_UNIX_EPOCH (G_GUINT64_CONSTANT(2208988800) * GST_SECOND)
++
++/* Capture time from the buffer's reference timestamp, as ns since the Unix
++ * epoch. Only the wall-clock references are used (timestamp/x-unix, and
++ * timestamp/x-ntp as rtspsrc attaches); anything else is not a UTC time. */
++static GstClockTime capture_time(GstBuffer *buf) {
++    static GstStaticCaps unix_caps = GST_STATIC_CAPS("timestamp/x-unix");
++    static GstStaticCaps ntp_caps = GST_STATIC_CAPS("timestamp/x-ntp");
++
++    GstClockTime t = GST_CLOCK_TIME_NONE;
++    GstCaps *caps = gst_static_caps_get(&unix_caps);
++    GstReferenceTimestampMeta *ref = gst_buffer_get_reference_timestamp_meta(buf, caps);
++    gst_caps_unref(caps);
++    if (ref && GST_CLOCK_TIME_IS_VALID(ref->timestamp))
++        return ref->timestamp;
++
++    caps = gst_static_caps_get(&ntp_caps);
++    ref = gst_buffer_get_reference_timestamp_meta(buf, caps);
++    gst_caps_unref(caps);
++    if (ref && GST_CLOCK_TIME_IS_VALID(ref->timestamp) &&
++        ref->timestamp >= NTP_TO_UNIX_EPOCH)
++        t = ref->timestamp - NTP_TO_UNIX_EPOCH;
++    return t;
++}
++
+ void convert(GstDxMsgConv *self, DXFrameMeta *frame_meta, GstBuffer *buf) {
+     int stream_id = (frame_meta && frame_meta->_stream_id >= 0)
+                         ? frame_meta->_stream_id : 0;
+     guint64 &seq = self->_seq_ids[stream_id];
+     if (self->_message_interval == 0 ||
+         (seq % self->_message_interval) == 0) {
+-        GstDxMsgMetaInfo meta_info;
++        GstDxMsgMetaInfo meta_info{};
+         meta_info._frame_meta = frame_meta;
+         meta_info._seq_id = seq;
+         meta_info._input_info = &self->_input_info;
+         meta_info._include_frame = self->_include_frame;
+         meta_info._frame_base64 = nullptr;
++        meta_info._payload_type = self->_payload_type;
++        meta_info._node_id = self->_node_id;
++        meta_info._pts = GST_BUFFER_PTS(buf);
++        meta_info._capture_time = capture_time(buf);
+ 
+         gchar *base64_str = nullptr;
+         if (self->_include_frame && self->_kernel_pool) {
+@@ -446,6 +509,12 @@ void convert(GstDxMsgConv *self, DXFrameMeta *frame_meta, GstBuffer *buf) {
+         }
+ 
+         dx_add_payload_to_buffer(buf, payload);
++        /* One key per source, so a partitioned broker keeps its order. */
++        GstDxMsgMeta *msg_meta = dx_get_msg_meta(buf);
++        if (msg_meta && frame_meta && !frame_meta->_sensor_id.empty()) {
++            g_free(msg_meta->_key);
++            msg_meta->_key = g_strdup(frame_meta->_sensor_id.c_str());
++        }
+ 
+         g_free(payload->_data);
+         g_free(payload);
+diff --git a/gst-dxstream-plugin/src/gst-dxmsgconv.hpp b/gst-dxstream-plugin/src/gst-dxmsgconv.hpp
+index fe3bac6..337a348 100644
+--- a/gst-dxstream-plugin/src/gst-dxmsgconv.hpp
++++ b/gst-dxstream-plugin/src/gst-dxmsgconv.hpp
+@@ -30,6 +30,8 @@ struct _GstDxMsgConv {
+     GstVideoInfo _input_info;
+     gchar *_config_file_path;
+     gchar *_library_file_path;
++    gchar *_node_id;
++    gint _payload_type;
+     void *_library_handle;
+     gboolean _include_frame;
+     int _cached_width;
+diff --git a/install.bat b/install.bat
+index 5f2fb12..5574038 100644
+--- a/install.bat
++++ b/install.bat
+@@ -276,5 +276,9 @@ if not exist "!VCPKG_INSTALLED!\lib\pkgconfig\rdkafka.pc" (
+     echo   [MISSING] vcpkg librdkafka: !VCPKG_INSTALLED!\lib\pkgconfig\rdkafka.pc
+     set "VCPKG_DEPS_OK=0"
+ )
++if not exist "!VCPKG_INSTALLED!\lib\pkgconfig\protobuf.pc" (
++    echo   [MISSING] vcpkg protobuf: !VCPKG_INSTALLED!\lib\pkgconfig\protobuf.pc
++    set "VCPKG_DEPS_OK=0"
++)
+ if "!VCPKG_DEPS_OK!"=="1" exit /b 0
+ exit /b 1
+diff --git a/scripts/setup/06_communication.sh b/scripts/setup/06_communication.sh
+index 3d7adb9..d0e03d4 100755
+--- a/scripts/setup/06_communication.sh
++++ b/scripts/setup/06_communication.sh
+@@ -64,6 +64,10 @@ setup_communication_libraries() {
+         "libjson-glib-dev:JSON handling library for GLib"
+         "librdkafka-dev:Apache Kafka C/C++ library"
+         "libmosquitto-dev:MQTT client library"
++        # Optional for dx_msgconvl: enables the protobuf payload backend
++        # (payload-type=4). Absent -> meson auto-disables it and JSON still builds.
++        "libprotobuf-dev:Protocol Buffers C++ runtime (optional, dx_msgconvl protobuf payload)"
++        "protobuf-compiler:Protocol Buffers compiler providing protoc (optional, dx_frame.proto codegen)"
+     )
+     
+     local missing_libs=()
+diff --git a/test/base/element/messaging/test_dxmsgbroker_failure_streak.cpp b/test/base/element/messaging/test_dxmsgbroker_failure_streak.cpp
+index 473ecc7..f4e6e1c 100644
+--- a/test/base/element/messaging/test_dxmsgbroker_failure_streak.cpp
++++ b/test/base/element/messaging/test_dxmsgbroker_failure_streak.cpp
+@@ -12,7 +12,7 @@ static int g_sends = 0;
+ static bool g_fail = true;
+ 
+ static DxMsg_Bal_Error_t stub_send(DxMsg_Bal_Handle_t, const char *,
+-                                   const void *, int) {
++                                   const char *, const void *, int) {
+     g_sends++;
+     return g_fail ? DxMsg_Bal_Error::DXMSG_BAL_ERR_BROKER
+                   : DxMsg_Bal_Error::DXMSG_BAL_OK;
+diff --git a/test/base/element/messaging/test_dxmsgconv.cpp b/test/base/element/messaging/test_dxmsgconv.cpp
+index 31c949f..0c81f7e 100644
+--- a/test/base/element/messaging/test_dxmsgconv.cpp
++++ b/test/base/element/messaging/test_dxmsgconv.cpp
+@@ -11,6 +11,7 @@
+ #include "npu_env.hpp"
+ 
+ #include <cstring>
++#include <string>
+ 
+ using namespace dxtest;
+ 
+@@ -202,6 +203,40 @@ GST_START_TEST(CE_msgconv_payload_attached) {
+ }
+ GST_END_TEST;
+ 
++// CE_msgconv_timestamp_emitted: buffer PTS is emitted as ptsNs in payload JSON
++// MUT: drop meta_info._pts population/emit → field absent from payload
++GST_START_TEST(CE_msgconv_timestamp_emitted) {
++    GstElement *e = gst_element_factory_make("dxmsgconv", nullptr);
++    g_object_set(e, "library-file-path", MSGCONV_LIB, nullptr);
++    GstHarness *h = gst_harness_new_with_element(e, "sink", "src");
++    gst_harness_set_src_caps_str(h, CAPS_STR);
++
++    const GstClockTime kPts = 1234567890ULL;
++    GstBuffer *in = make_buf_with_meta(kPts, 0, 1);
++    fail_unless_equals_int(gst_harness_push(h, in), GST_FLOW_OK);
++
++    GstBuffer *out = gst_harness_pull(h);
++    fail_unless(out != nullptr, "output buffer must arrive");
++    GstDxMsgMeta *mm = (GstDxMsgMeta *)gst_buffer_get_meta(
++        out, gst_dxmsg_meta_api_get_type());
++    fail_unless(mm != nullptr && mm->_payload != nullptr,
++                "payload must be attached");
++    DxMsgPayload *pl = (DxMsgPayload *)mm->_payload;
++    std::string json((const char *)pl->_data, pl->_size);
++
++    auto key = json.find("\"ptsNs\"");
++    fail_unless(key != std::string::npos, "payload JSON has no ptsNs: %s",
++                json.c_str());
++    auto val = json.find_first_not_of(" :", key + 7);
++    fail_unless(json.compare(val, 10, "1234567890") == 0,
++                "ptsNs must carry the buffer PTS: %s", json.c_str());
++
++    gst_buffer_unref(out);
++    gst_harness_teardown(h);
++    gst_object_unref(e);
++}
++GST_END_TEST;
++
+ // CE_msgconv_message_interval: message-interval=3 → only every 3rd buffer is converted
+ // Target: convert() L383-384 (seq_id % message_interval)
+ // MUT: remove L383 condition → all buffers converted
+@@ -284,6 +319,7 @@ static Suite *dxmsgconv_suite(void) {
+     tcase_add_test(tc, CE_msgconv_bad_config_path_uses_properties);
+     tcase_add_test(tc, CE_msgconv_no_meta_passthrough);
+     tcase_add_test(tc, CE_msgconv_payload_attached);
++    tcase_add_test(tc, CE_msgconv_timestamp_emitted);
+     tcase_add_test(tc, CE_msgconv_message_interval);
+     tcase_add_test(tc, CE_msgconv_dlclose_reopen);
+     tcase_add_test(tc, CE_msgconv_config_loads_properties);
+diff --git a/test/base/element/messaging/test_dxmsgconv_identity.cpp b/test/base/element/messaging/test_dxmsgconv_identity.cpp
+new file mode 100644
+index 0000000..16de9b1
+--- /dev/null
++++ b/test/base/element/messaging/test_dxmsgconv_identity.cpp
+@@ -0,0 +1,158 @@
++// dxmsgconv — source identity and capture time in each message
++//   sensorId / nodeId: DXFrameMeta._sensor_id and the "node-id" property
++//   message key: the source's sensor id, on GstDxMsgMeta
++//   captureTime: RFC 3339 UTC from a timestamp/x-ntp or timestamp/x-unix
++//                reference; other references are not wall-clock time
++
++#include <gst/check/gstcheck.h>
++#include <gst/check/gstharness.h>
++#include <gst/gst.h>
++#include "harness_helpers.hpp"
++#include "meta_helpers.hpp"
++#include "npu_env.hpp"
++#include <cstring>
++#include <string>
++
++using namespace dxtest;
++
++static const char *CAPS_STR =
++    "video/x-raw,format=RGB,width=4,height=4,framerate=30/1";
++static std::string MSGCONV_LIB_PATH() {
++    return dxtest::resolve_lib_path("libdx_msgconvl.so");
++}
++#define MSGCONV_LIB (MSGCONV_LIB_PATH().c_str())
++
++static GstBuffer *make_buf_with_sensor(GstClockTime pts, int stream_id,
++                                       const char *sensor_id) {
++    gsize sz = 4 * 4 * 3;
++    GstBuffer *b = gst_buffer_new_allocate(nullptr, sz, nullptr);
++    GstMapInfo m; gst_buffer_map(b, &m, GST_MAP_WRITE);
++    std::memset(m.data, 0x80, sz); gst_buffer_unmap(b, &m);
++    GST_BUFFER_PTS(b) = pts;
++    GST_BUFFER_DURATION(b) = GST_SECOND / 30;
++    DXFrameMeta *fm = make_frame_meta(b, stream_id, 4, 4);
++    fm->_sensor_id = sensor_id;
++    add_object_to_frame(fm, 1, 0.9f, 0, 0, 1, 1);
++    return b;
++}
++
++// Extract string value of "<key>":"<value>" from JSON (first match).
++static std::string find_string_field(const std::string &json, const char *key) {
++    std::string needle = std::string("\"") + key + "\"";
++    auto p = json.find(needle);
++    if (p == std::string::npos) return "";
++    p = json.find(':', p);
++    if (p == std::string::npos) return "";
++    p++;
++    while (p < json.size() && (json[p] == ' ' || json[p] == '\t')) p++;
++    if (p >= json.size() || json[p] != '"') return "";
++    p++;
++    std::string out;
++    while (p < json.size() && json[p] != '"') { out += json[p]; p++; }
++    return out;
++}
++
++struct Converted {
++    std::string json;
++    std::string key;
++};
++
++static Converted convert_one(GstBuffer *in, const char *node_id = nullptr) {
++    GstElement *e = gst_element_factory_make("dxmsgconv", nullptr);
++    g_object_set(e, "library-file-path", MSGCONV_LIB, nullptr);
++    if (node_id)
++        g_object_set(e, "node-id", node_id, nullptr);
++    GstHarness *h = gst_harness_new_with_element(e, "sink", "src");
++    fail_unless(h != nullptr);
++    gst_harness_set_src_caps_str(h, CAPS_STR);
++    fail_unless_equals_int(gst_harness_push(h, in), GST_FLOW_OK);
++
++    GstBuffer *out = gst_harness_pull(h);
++    fail_unless(out != nullptr);
++    GstDxMsgMeta *mm = dx_get_msg_meta(out);
++    fail_unless(mm != nullptr, "buffer missing DxMsgMeta");
++    DxMsgPayload *pl = (DxMsgPayload *)mm->_payload;
++    fail_unless(pl && pl->_data && pl->_size > 0);
++    Converted r{std::string((const char *)pl->_data, pl->_size),
++                mm->_key ? mm->_key : ""};
++
++    gst_buffer_unref(out);
++    gst_harness_teardown(h);
++    gst_object_unref(e);
++    return r;
++}
++
++static void add_reference(GstBuffer *b, const char *caps, GstClockTime t) {
++    GstCaps *c = gst_caps_from_string(caps);
++    gst_buffer_add_reference_timestamp_meta(b, c, t, GST_CLOCK_TIME_NONE);
++    gst_caps_unref(c);
++}
++
++/* 2026-09-29T01:02:03.456789012Z */
++static const GstClockTime kUnix = G_GUINT64_CONSTANT(1790643723) * GST_SECOND + 456789012;
++static const char *kRfc3339 = "2026-09-29T01:02:03.456789012Z";
++static const GstClockTime kNtpOffset = G_GUINT64_CONSTANT(2208988800) * GST_SECOND;
++
++GST_START_TEST(ID_msgconv_sensor_and_node_id) {
++    Converted r = convert_one(make_buf_with_sensor(0, 0, "cam01"), "node-01");
++    std::string sensor = find_string_field(r.json, "sensorId");
++    std::string node = find_string_field(r.json, "nodeId");
++    fail_unless_equals_string(sensor.c_str(), "cam01");
++    fail_unless_equals_string(node.c_str(), "node-01");
++}
++GST_END_TEST;
++
++GST_START_TEST(ID_msgconv_key_is_sensor_id) {
++    Converted r = convert_one(make_buf_with_sensor(0, 0, "cam01"));
++    fail_unless_equals_string(r.key.c_str(), "cam01");
++
++    r = convert_one(make_buf_with_sensor(0, 0, ""));
++    fail_unless(r.key.empty(), "no sensor id must mean no key, got '%s'",
++                r.key.c_str());
++    fail_unless(r.json.find("sensorId") == std::string::npos);
++}
++GST_END_TEST;
++
++GST_START_TEST(ID_msgconv_capture_time_from_ntp) {
++    GstBuffer *b = make_buf_with_sensor(0, 0, "cam01");
++    add_reference(b, "timestamp/x-ntp", kUnix + kNtpOffset);
++    Converted r = convert_one(b);
++    std::string t = find_string_field(r.json, "captureTime");
++    fail_unless_equals_string(t.c_str(), kRfc3339);
++}
++GST_END_TEST;
++
++GST_START_TEST(ID_msgconv_capture_time_from_unix) {
++    GstBuffer *b = make_buf_with_sensor(0, 0, "cam01");
++    add_reference(b, "timestamp/x-unix", kUnix);
++    Converted r = convert_one(b);
++    std::string t = find_string_field(r.json, "captureTime");
++    fail_unless_equals_string(t.c_str(), kRfc3339);
++}
++GST_END_TEST;
++
++GST_START_TEST(ID_msgconv_capture_time_ignores_other_references) {
++    GstBuffer *b = make_buf_with_sensor(0, 0, "cam01");
++    // Large enough that misreading it as NTP would yield a valid time.
++    add_reference(b, "timestamp/x-ptp", kUnix + kNtpOffset);
++    Converted r = convert_one(b);
++    fail_unless(r.json.find("captureTime") == std::string::npos,
++                "a non-UTC reference must not become captureTime: %s",
++                r.json.c_str());
++}
++GST_END_TEST;
++
++static Suite *dxmsgconv_identity_suite(void) {
++    Suite *s = suite_create("dxmsgconv_identity");
++    TCase *tc = tcase_create("identity");
++    tcase_set_timeout(tc, 15.0);
++    suite_add_tcase(s, tc);
++    tcase_add_test(tc, ID_msgconv_sensor_and_node_id);
++    tcase_add_test(tc, ID_msgconv_key_is_sensor_id);
++    tcase_add_test(tc, ID_msgconv_capture_time_from_ntp);
++    tcase_add_test(tc, ID_msgconv_capture_time_from_unix);
++    tcase_add_test(tc, ID_msgconv_capture_time_ignores_other_references);
++    return s;
++}
++
++GST_CHECK_MAIN(dxmsgconv_identity);
+diff --git a/test/base/element/multistream/test_dxinputselector.cpp b/test/base/element/multistream/test_dxinputselector.cpp
+index bafc798..4026dbd 100644
+--- a/test/base/element/multistream/test_dxinputselector.cpp
++++ b/test/base/element/multistream/test_dxinputselector.cpp
+@@ -387,6 +387,54 @@ GST_START_TEST(CE_inputsel_caps_wrapping) {
+ }
+ GST_END_TEST;
+ 
++static void set_pad_sensor_id(GstElement *agg, const char *pad_name,
++                              const char *sensor_id) {
++    GstPad *pad = gst_element_get_static_pad(agg, pad_name);
++    fail_unless(pad != nullptr);
++    g_object_set(pad, "sensor-id", sensor_id, nullptr);
++    gchar *got = nullptr;
++    g_object_get(pad, "sensor-id", &got, nullptr);
++    fail_unless_equals_string(got, sensor_id);
++    g_free(got);
++    gst_object_unref(pad);
++}
++
++// CE_inputsel_sensor_id_stamp: sink pad "sensor-id" → clip() stamps _sensor_id
++// MUT: remove stamp in clip() → _sensor_id stays empty
++GST_START_TEST(CE_inputsel_sensor_id_stamp) {
++    AggPipe p = make_agg_pipe("dxinputselector", 2);
++    set_pad_sensor_id(p.agg, "sink_0", "cam01");
++    set_pad_sensor_id(p.agg, "sink_1", "cam02");
++    p.start();
++
++    p.push(0, make_buf(100 * GST_MSECOND));
++    p.push(1, make_buf(200 * GST_MSECOND));
++
++    GstSample *s = p.pull();
++    fail_unless(s != nullptr, "first output must arrive");
++    DXFrameMeta *fm = dx_get_frame_meta(gst_sample_get_buffer(s));
++    fail_unless(fm != nullptr);
++    fail_unless_equals_int(fm->_stream_id, 0);
++    fail_unless_equals_string(fm->_sensor_id.c_str(), "cam01");
++    gst_sample_unref(s);
++
++    // src0 drained → push more so aggregate can advance to src1's 200ms (min logic)
++    p.push(0, make_buf(300 * GST_MSECOND));
++
++    s = p.pull();
++    fail_unless(s != nullptr, "second output must arrive");
++    fm = dx_get_frame_meta(gst_sample_get_buffer(s));
++    fail_unless(fm != nullptr);
++    fail_unless_equals_int(fm->_stream_id, 1);
++    fail_unless_equals_string(fm->_sensor_id.c_str(), "cam02");
++    gst_sample_unref(s);
++
++    p.eos(0);
++    p.eos(1);
++    p.stop();
++}
++GST_END_TEST;
++
+ // CE_inputsel_caps_change_labels_queued_buffers: buffers queued before a CAPS
+ // change keep the old size in DXFrameMeta. GstAggregator clips lazily, when a
+ // buffer is consumed, so the pad's current caps may already be the new ones.
+@@ -450,6 +498,7 @@ static Suite *dxinputselector_suite(void) {
+     tcase_add_test(tc, CE_inputsel_min_pts_order);
+     tcase_add_test(tc, CE_inputsel_per_stream_wrapped_eos);
+     tcase_add_test(tc, CE_inputsel_caps_wrapping);
++    tcase_add_test(tc, CE_inputsel_sensor_id_stamp);
+     tcase_add_test(tc, CE_inputsel_caps_change_labels_queued_buffers);
+     return s;
+ }
+diff --git a/test/base/metadata/test_dxframemeta.cpp b/test/base/metadata/test_dxframemeta.cpp
+index c75ea3c..4b90f76 100644
+--- a/test/base/metadata/test_dxframemeta.cpp
++++ b/test/base/metadata/test_dxframemeta.cpp
+@@ -39,6 +39,7 @@ GST_START_TEST(TC1_init_defaults) {
+     fail_unless(fm->_format.empty());
+     fail_unless(fm->_name.empty());
+     fail_unless(fm->_label_name.empty());
++    fail_unless(fm->_sensor_id.empty());
+     fail_unless_equals_int((int)fm->_object_meta_list.size(), 0);
+     fail_unless_equals_int((int)fm->_frame_user_meta_list.size(), 0);
+     fail_unless_equals_int((int)fm->_seg_data.size(), 0);
+@@ -343,6 +344,21 @@ GST_START_TEST(TC17_copy_depth_nonempty) {
+ }
+ GST_END_TEST;
+ 
++// ---- TC18: _sensor_id copied on buffer copy ----
++GST_START_TEST(TC18_copy_sensor_id) {
++    GstBuffer *buf = fresh_buf();
++    DXFrameMeta *src = dx_get_frame_meta(buf);
++    src->_sensor_id = "cam01";
++
++    GstBuffer *dup = gst_buffer_copy(buf);
++    DXFrameMeta *dst = dx_get_frame_meta(dup);
++    fail_unless(dst != nullptr);
++    fail_unless_equals_string(dst->_sensor_id.c_str(), "cam01");
++    gst_buffer_unref(buf);
++    gst_buffer_unref(dup);
++}
++GST_END_TEST;
++
+ static Suite *dxframemeta_suite(void) {
+     Suite *s = suite_create("dxframemeta");
+     TCase *tc = tcase_create("contract");
+@@ -364,6 +380,7 @@ static Suite *dxframemeta_suite(void) {
+     tcase_add_test(tc, TC15_transform_skips_if_exists);
+     tcase_add_test(tc, TC16_free_releases_children);
+     tcase_add_test(tc, TC17_copy_depth_nonempty);
++    tcase_add_test(tc, TC18_copy_sensor_id);
+     return s;
+ }
+ 
+diff --git a/vcpkg.json b/vcpkg.json
+index 5edbcd1..a67676b 100644
+--- a/vcpkg.json
++++ b/vcpkg.json
+@@ -8,6 +8,7 @@
+     "opencv4",
+     "libyuv",
+     "mosquitto",
+-    "librdkafka"
++    "librdkafka",
++    "protobuf"
+   ]
+ }
+-- 
+2.43.0
+

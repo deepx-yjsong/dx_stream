@@ -1,0 +1,311 @@
+From 74de8ff783bd47b8d2088d90504be6408c0fa88d Mon Sep 17 00:00:00 2001
+From: deepx-yjsong <yjsong@deepx.ai>
+Date: Mon, 28 Sep 2026 16:19:02 +0900
+Subject: [PATCH 03/10] fix(tracker,msgconv): end a stream's state on its
+ per-stream EOS
+
+dxtracker (trackers) and dxmsgconv (seqId counters) keep per-stream-id
+state that is only cleared as a whole. A source attached to a re-requested
+dxinputselector pad inherited the old source's tracks and seqId, and both
+maps grew with every stream.
+
+Both now drop the stream's entry on the wrapped per-stream EOS in
+sink_event before chaining up.
+
+Tests (black-box): after the EOS, a new box on the stream gets a fresh
+tracker's track id; the stream's seqId restarts at 1 (before: 3).
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ gst-dxstream-plugin/src/gst-dxmsgconv.cpp     |  26 ++++
+ gst-dxstream-plugin/src/gst-dxtracker.cpp     |  12 ++
+ .../inference/test_dxtracker_eviction.cpp     |  79 ++++++++++++
+ .../messaging/test_dxmsgconv_eviction.cpp     | 116 ++++++++++++++++++
+ 4 files changed, 233 insertions(+)
+ create mode 100644 test/base/element/inference/test_dxtracker_eviction.cpp
+ create mode 100644 test/base/element/messaging/test_dxmsgconv_eviction.cpp
+
+diff --git a/gst-dxstream-plugin/src/gst-dxmsgconv.cpp b/gst-dxstream-plugin/src/gst-dxmsgconv.cpp
+index 4ddcf95..2a0d98a 100644
+--- a/gst-dxstream-plugin/src/gst-dxmsgconv.cpp
++++ b/gst-dxstream-plugin/src/gst-dxmsgconv.cpp
+@@ -34,6 +34,8 @@ static gboolean gst_dxmsgconv_propose_allocation(GstBaseTransform *trans,
+ static gboolean gst_dxmsgconv_query(GstBaseTransform *trans,
+                                     GstPadDirection direction,
+                                     GstQuery *query);
++static gboolean gst_dxmsgconv_sink_event(GstBaseTransform *trans,
++                                         GstEvent *event);
+ 
+ G_DEFINE_TYPE(GstDxMsgConv, gst_dxmsgconv, GST_TYPE_BASE_TRANSFORM);
+ 
+@@ -223,6 +225,8 @@ static void gst_dxmsgconv_class_init(GstDxMsgConvClass *klass) {
+     base_transform_class->propose_allocation =
+         GST_DEBUG_FUNCPTR(gst_dxmsgconv_propose_allocation);
+     base_transform_class->query = GST_DEBUG_FUNCPTR(gst_dxmsgconv_query);
++    base_transform_class->sink_event =
++        GST_DEBUG_FUNCPTR(gst_dxmsgconv_sink_event);
+ 
+     parent_class = GST_ELEMENT_CLASS(g_type_class_peek_parent(klass));
+ 
+@@ -453,6 +457,28 @@ void convert(GstDxMsgConv *self, DXFrameMeta *frame_meta, GstBuffer *buf) {
+     }
+ }
+ 
++// ---------------------------------------------------------------------------
++// sink_event — a per-stream EOS drops that stream's seqId counter, so a source
++// reusing the pad (= stream id) starts a new sequence
++// ---------------------------------------------------------------------------
++static gboolean gst_dxmsgconv_sink_event(GstBaseTransform *trans,
++                                         GstEvent *event) {
++    GstDxMsgConv *self = GST_DXMSGCONV(trans);
++
++    if (dx_event_is_wrapped_downstream(event)) {
++        gint stream_id = -1;
++        GstEvent *inner = dx_event_peek_inner(event, &stream_id);
++        if (inner && GST_EVENT_TYPE(inner) == GST_EVENT_EOS &&
++            self->_seq_ids.erase(stream_id) > 0) {
++            GST_DEBUG_OBJECT(self,
++                             "Per-stream EOS: dropped seqId counter for stream %d",
++                             stream_id);
++        }
++    }
++
++    return GST_BASE_TRANSFORM_CLASS(parent_class)->sink_event(trans, event);
++}
++
+ // ---------------------------------------------------------------------------
+ // set_caps — configure video info and reset RGB kernel on caps change
+ // ---------------------------------------------------------------------------
+diff --git a/gst-dxstream-plugin/src/gst-dxtracker.cpp b/gst-dxstream-plugin/src/gst-dxtracker.cpp
+index 5f7756f..332a9dd 100644
+--- a/gst-dxstream-plugin/src/gst-dxtracker.cpp
++++ b/gst-dxstream-plugin/src/gst-dxtracker.cpp
+@@ -273,6 +273,18 @@ static gboolean gst_dxtracker_sink_event(GstBaseTransform *trans,
+         self->_trackers.clear();
+     }
+ 
++    /* Per-stream EOS: drop that stream's tracker, so a source reusing the pad
++     * (= stream id) does not inherit its tracks. */
++    if (dx_event_is_wrapped_downstream(event)) {
++        gint stream_id = -1;
++        GstEvent *inner = dx_event_peek_inner(event, &stream_id);
++        if (inner && GST_EVENT_TYPE(inner) == GST_EVENT_EOS &&
++            self->_trackers.erase(stream_id) > 0) {
++            GST_DEBUG_OBJECT(self, "Per-stream EOS: dropped tracker for stream %d",
++                             stream_id);
++        }
++    }
++
+     return GST_BASE_TRANSFORM_CLASS(parent_class)->sink_event(trans, event);
+ }
+ 
+diff --git a/test/base/element/inference/test_dxtracker_eviction.cpp b/test/base/element/inference/test_dxtracker_eviction.cpp
+new file mode 100644
+index 0000000..a9b0136
+--- /dev/null
++++ b/test/base/element/inference/test_dxtracker_eviction.cpp
+@@ -0,0 +1,79 @@
++// dxtracker — a per-stream EOS drops that stream's tracker
++// Oracle: track ids come from a per-instance counter, so after the EOS a new
++// box on the same stream gets the id a fresh tracker would assign (id_b ==
++// id_a); a surviving tracker would assign a later one.
++
++#include <gst/check/gstcheck.h>
++#include <gst/check/gstharness.h>
++#include <gst/gst.h>
++#include "harness_helpers.hpp"
++#include "meta_helpers.hpp"
++#include "utils.hpp"
++
++using namespace dxtest;
++
++static const char *CAPS_320 =
++    "video/x-raw,format=RGB,width=320,height=240,framerate=30/1";
++static const guint BUF_SIZE = 320 * 240 * 3;
++
++// Feed `frames` buffers of the same box on `stream_id`, return the track_id of
++// the (single) surviving object on the last frame (-1 if none survived).
++static int feed_box_and_last_track_id(GstHarness *h, int stream_id,
++                                      float bx, float by, float bw, float bh,
++                                      int frames, GstClockTime base_pts) {
++    int last_id = -1;
++    for (int i = 0; i < frames; i++) {
++        GstBuffer *b = gst_harness_create_buffer(h, BUF_SIZE);
++        GST_BUFFER_PTS(b) = base_pts + (GstClockTime)i * GST_SECOND / 30;
++        GST_BUFFER_DURATION(b) = GST_SECOND / 30;
++        DXFrameMeta *fm = make_frame_meta(b, stream_id, 320, 240);
++        add_object_to_frame(fm, 0, 0.9f, bx, by, bw, bh);
++        fail_unless_equals_int(gst_harness_push(h, b), GST_FLOW_OK);
++
++        GstBuffer *out = gst_harness_pull(h);
++        fail_unless(out != nullptr, "frame %d must produce output", i);
++        DXFrameMeta *ofm = dx_get_frame_meta(out);
++        fail_unless(ofm != nullptr);
++        if (!ofm->_object_meta_list.empty())
++            last_id = ofm->_object_meta_list[0]->_track_id;
++        gst_buffer_unref(out);
++    }
++    return last_id;
++}
++
++GST_START_TEST(EV_tracker_per_stream_eos_evicts_tracker) {
++    Harness h("dxtracker");
++    gst_harness_set_src_caps_str(h.h, CAPS_320);
++
++    // Stream 1, box A.
++    int id_a = feed_box_and_last_track_id(h.h, 1, 10, 10, 50, 50, 5, 0);
++    fail_unless(id_a >= 1,
++                "phase 1: a stable track must be assigned an id (got %d)", id_a);
++
++    // Stream 1 ends.
++    GstEvent *wrapped = dx_event_wrap_downstream(1, gst_event_new_eos());
++    fail_unless(gst_harness_push_event(h.h, wrapped),
++                "wrapped per-stream EOS push must succeed");
++
++    // Stream 1 reused, far-away box B.
++    int id_b = feed_box_and_last_track_id(h.h, 1, 250, 180, 300, 230, 5,
++                                          10 * GST_SECOND / 30);
++
++    fail_unless(id_b == id_a,
++                "after wrapped per-stream EOS(1), reused stream 1 must get a "
++                "FRESH tracker — expected track_id %d (same as a fresh tracker), "
++                "got %d — dxtracker did not erase _trackers[1]", id_a, id_b);
++
++}
++GST_END_TEST;
++
++static Suite *dxtracker_eviction_suite(void) {
++    Suite *s = suite_create("dxtracker_eviction");
++    TCase *tc = tcase_create("eviction");
++    tcase_set_timeout(tc, 20.0);
++    suite_add_tcase(s, tc);
++    tcase_add_test(tc, EV_tracker_per_stream_eos_evicts_tracker);
++    return s;
++}
++
++GST_CHECK_MAIN(dxtracker_eviction);
+diff --git a/test/base/element/messaging/test_dxmsgconv_eviction.cpp b/test/base/element/messaging/test_dxmsgconv_eviction.cpp
+new file mode 100644
+index 0000000..069c2bb
+--- /dev/null
++++ b/test/base/element/messaging/test_dxmsgconv_eviction.cpp
+@@ -0,0 +1,116 @@
++// dxmsgconv — a per-stream EOS drops that stream's seqId counter
++// Oracle (default convert library JSON): stream 1 gives seqId 1, 2; after its
++// EOS the next buffer on stream 1 gives 1 again (3 without the fix).
++
++#include <gst/check/gstcheck.h>
++#include <gst/check/gstharness.h>
++#include <gst/gst.h>
++#include "harness_helpers.hpp"
++#include "meta_helpers.hpp"
++#include "npu_env.hpp"
++#include "utils.hpp"
++#include <cstring>
++#include <string>
++#include <vector>
++
++using namespace dxtest;
++
++static const char *CAPS_STR =
++    "video/x-raw,format=RGB,width=4,height=4,framerate=30/1";
++static std::string MSGCONV_LIB_PATH() {
++    return dxtest::resolve_lib_path("libdx_msgconvl.so");
++}
++#define MSGCONV_LIB (MSGCONV_LIB_PATH().c_str())
++
++static GstBuffer *make_buf_with_meta(GstClockTime pts, int stream_id) {
++    gsize sz = 4 * 4 * 3;
++    GstBuffer *b = gst_buffer_new_allocate(nullptr, sz, nullptr);
++    GstMapInfo m; gst_buffer_map(b, &m, GST_MAP_WRITE);
++    std::memset(m.data, 0x80, sz); gst_buffer_unmap(b, &m);
++    GST_BUFFER_PTS(b) = pts;
++    GST_BUFFER_DURATION(b) = GST_SECOND / 30;
++    DXFrameMeta *fm = make_frame_meta(b, stream_id, 4, 4);
++    add_object_to_frame(fm, 1, 0.9f, 0, 0, 1, 1);
++    return b;
++}
++
++// Extract integer value of "<key>": from a JSON snippet (first match).
++static int find_int_field(const std::string &json, const char *key) {
++    std::string needle = std::string("\"") + key + "\"";
++    auto p = json.find(needle);
++    if (p == std::string::npos) return -1;
++    p = json.find(':', p);
++    if (p == std::string::npos) return -1;
++    p++;
++    while (p < json.size() && (json[p] == ' ' || json[p] == '\t')) p++;
++    int sign = 1;
++    if (p < json.size() && json[p] == '-') { sign = -1; p++; }
++    int val = 0;
++    bool any = false;
++    while (p < json.size() && json[p] >= '0' && json[p] <= '9') {
++        val = val * 10 + (json[p] - '0'); p++; any = true;
++    }
++    return any ? sign * val : -1;
++}
++
++static int pull_seq_id(GstHarness *h) {
++    GstBuffer *out = gst_harness_pull(h);
++    fail_unless(out != nullptr, "expected an output buffer");
++    GstDxMsgMeta *mm = (GstDxMsgMeta *)gst_buffer_get_meta(
++        out, gst_dxmsg_meta_api_get_type());
++    fail_unless(mm != nullptr, "output buffer missing DxMsgMeta");
++    DxMsgPayload *pl = (DxMsgPayload *)mm->_payload;
++    fail_unless(pl && pl->_data && pl->_size > 0);
++    std::string json((const char *)pl->_data, pl->_size);
++    int seq = find_int_field(json, "seqId");
++    gst_buffer_unref(out);
++    return seq;
++}
++
++GST_START_TEST(EV_msgconv_per_stream_eos_evicts_seq) {
++    GstElement *e = gst_element_factory_make("dxmsgconv", nullptr);
++    g_object_set(e, "library-file-path", MSGCONV_LIB, nullptr);
++    GstHarness *h = gst_harness_new_with_element(e, "sink", "src");
++    fail_unless(h != nullptr);
++    gst_harness_set_src_caps_str(h, CAPS_STR);
++
++    // Two buffers on stream 1 → seqId 1, 2.
++    fail_unless_equals_int(
++        gst_harness_push(h, make_buf_with_meta(0, 1)), GST_FLOW_OK);
++    int first = pull_seq_id(h);
++    fail_unless_equals_int(
++        gst_harness_push(h, make_buf_with_meta(GST_SECOND / 30, 1)), GST_FLOW_OK);
++    int second = pull_seq_id(h);
++    fail_unless(first == 1 && second == 2,
++                "baseline seq must be 1,2 (got %d,%d)", first, second);
++
++    // Stream 1 ends.
++    GstEvent *wrapped = dx_event_wrap_downstream(1, gst_event_new_eos());
++    fail_unless(gst_harness_push_event(h, wrapped),
++                "wrapped per-stream EOS push must succeed");
++
++    // Stream 1 reused.
++    fail_unless_equals_int(
++        gst_harness_push(h, make_buf_with_meta(2 * GST_SECOND / 30, 1)),
++        GST_FLOW_OK);
++    int third = pull_seq_id(h);
++
++    fail_unless(third == 1,
++                "after wrapped per-stream EOS(1), stream 1 seqId must reset to "
++                "1 (got %d) — dxmsgconv did not erase _seq_ids[1]", third);
++
++    gst_harness_teardown(h);
++    gst_object_unref(e);
++}
++GST_END_TEST;
++
++static Suite *dxmsgconv_eviction_suite(void) {
++    Suite *s = suite_create("dxmsgconv_eviction");
++    TCase *tc = tcase_create("eviction");
++    tcase_set_timeout(tc, 15.0);
++    suite_add_tcase(s, tc);
++    tcase_add_test(tc, EV_msgconv_per_stream_eos_evicts_seq);
++    return s;
++}
++
++GST_CHECK_MAIN(dxmsgconv_eviction);
+-- 
+2.43.0
+

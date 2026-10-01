@@ -1,0 +1,220 @@
+From a3c01eb53f203544f689ef126584195d11d6e954 Mon Sep 17 00:00:00 2001
+From: deepx-yjsong <yjsong@deepx.ai>
+Date: Thu, 17 Sep 2026 17:43:09 +0900
+Subject: [PATCH 02/10] fix(infer): end a stream's EOS state when its drain is
+ done
+
+A per-stream EOS latches its stream id in stream_eos_arrived and chain()
+drops every buffer with a latched id. No single id was ever removed (only
+FLUSH_STOP / READY->PAUSED clear the set). The stream id is the
+dxinputselector pad index, so a source attached to a re-requested pad was
+dropped forever, logged only at INFO.
+
+Release the latch once the drain completes. stream_pending_buffers is
+erased too, but only when it drained to zero: after an early exit, late
+completions still decrement it. The drain predicate uses find() instead of
+operator[], which inserted an entry for every stream.
+
+Test (white-box, stub backend, no NPU): latch released, no stray counter,
+undrained counter kept, other streams untouched (three fail before).
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ gst-dxstream-plugin/src/gst-dxinfer.cpp       |  19 ++-
+ .../inference/test_dxinfer_per_stream_eos.cpp | 145 ++++++++++++++++++
+ 2 files changed, 162 insertions(+), 2 deletions(-)
+ create mode 100644 test/base/element/inference/test_dxinfer_per_stream_eos.cpp
+
+diff --git a/gst-dxstream-plugin/src/gst-dxinfer.cpp b/gst-dxstream-plugin/src/gst-dxinfer.cpp
+index 7a65482..849e898 100644
+--- a/gst-dxstream-plugin/src/gst-dxinfer.cpp
++++ b/gst-dxstream-plugin/src/gst-dxinfer.cpp
+@@ -472,10 +472,12 @@ gboolean handle_custom_downstream_event(GstDxInfer *self, GstEvent *event) {
+ 
+             if (!self->_secondary_mode) {
+                 std::unique_lock<std::mutex> lock(self->_push_ctx.push_lock);
++                /* find(): operator[] would insert an entry. */
+                 self->_push_ctx.cv.wait(lock, [self, stream_id] {
+                     std::lock_guard<std::mutex> eos_lk(self->_eos_ctx.eos_lock);
+-                    return self->_eos_ctx.stream_pending_buffers[stream_id] <= 0 ||
+-                           !self->_push_ctx.push_running;
++                    auto it = self->_eos_ctx.stream_pending_buffers.find(stream_id);
++                    return it == self->_eos_ctx.stream_pending_buffers.end() ||
++                           it->second <= 0 || !self->_push_ctx.push_running;
+                 });
+             }
+ 
+@@ -485,6 +487,19 @@ gboolean handle_custom_downstream_event(GstDxInfer *self, GstEvent *event) {
+             } else {
+                 gst_event_unref(event);
+             }
++
++            /* The stream is over and its pad (= stream id) may be requested
++             * again: release the latch, or the next source is dropped forever.
++             * Drop the in-flight counter only if it drained -- otherwise late
++             * completions still decrement it. */
++            {
++                std::lock_guard<std::mutex> lock(self->_eos_ctx.eos_lock);
++                self->_eos_ctx.stream_eos_arrived.erase(stream_id);
++                auto it = self->_eos_ctx.stream_pending_buffers.find(stream_id);
++                if (it != self->_eos_ctx.stream_pending_buffers.end() &&
++                    it->second <= 0)
++                    self->_eos_ctx.stream_pending_buffers.erase(it);
++            }
+         } else {
+             res = gst_pad_push_event(self->_srcpad, event);
+         }
+diff --git a/test/base/element/inference/test_dxinfer_per_stream_eos.cpp b/test/base/element/inference/test_dxinfer_per_stream_eos.cpp
+new file mode 100644
+index 0000000..528f29d
+--- /dev/null
++++ b/test/base/element/inference/test_dxinfer_per_stream_eos.cpp
+@@ -0,0 +1,145 @@
++// dxinfer — per-stream EOS state ends with the stream
++// A re-requested dxinputselector pad reuses the stream id; its source must not
++// inherit the latch or counters.  White-box, stub backend, no NPU.
++
++#include <gst/check/gstcheck.h>
++#include <gst/gst.h>
++#include "gst-dxinfer.hpp"
++
++
++class StubInferBackend final : public IInferBackend {
++public:
++    bool Init(const InferBackendOptions&) override { return true; }
++    bool Put(void*, void*) override { return true; }
++    bool Get(dxs::DXTensors&) override { return true; }
++    void Flush() override {}
++    void Reset() override {}
++    size_t GetOutputBufferSize() const override { return 0; }
++    const char* GetName() const override { return "stub"; }
++    bool IsFlushed() const override { return false; }
++};
++
++struct InferUnderTest {
++    GstDxInfer *infer;
++    GstPad *sinkpad;
++
++    static InferUnderTest make() {
++        InferUnderTest t;
++        t.infer = GST_DXINFER(gst_element_factory_make("dxinfer", nullptr));
++        fail_unless(t.infer != nullptr);
++        t.infer->_backend.reset(new StubInferBackend);
++        t.sinkpad = gst_element_get_static_pad(GST_ELEMENT(t.infer), "sink");
++        gst_pad_set_active(t.sinkpad, TRUE);
++        return t;
++    }
++
++    // The event dxinputselector sends when one of its streams ends.
++    void send_per_stream_eos(int stream_id) {
++        GstEvent *eos = gst_event_new_eos();
++        GstStructure *s = gst_structure_new(
++            "application/x-dx-wrapped-event",
++            "stream-id", G_TYPE_INT, stream_id,
++            "event", GST_TYPE_EVENT, eos, nullptr);
++        gst_event_unref(eos);
++        gst_pad_send_event(sinkpad,
++                           gst_event_new_custom(GST_EVENT_CUSTOM_DOWNSTREAM, s));
++    }
++
++    bool latched(int stream_id) {
++        std::lock_guard<std::mutex> lock(infer->_eos_ctx.eos_lock);
++        return infer->_eos_ctx.stream_eos_arrived.count(stream_id) > 0;
++    }
++
++    bool has_pending_entry(int stream_id) {
++        std::lock_guard<std::mutex> lock(infer->_eos_ctx.eos_lock);
++        return infer->_eos_ctx.stream_pending_buffers.count(stream_id) > 0;
++    }
++
++    void destroy() {
++        gst_pad_set_active(sinkpad, FALSE);
++        gst_object_unref(sinkpad);
++        gst_object_unref(infer);
++    }
++};
++
++GST_START_TEST(per_stream_eos_releases_its_latch) {
++    auto t = InferUnderTest::make();
++
++    t.send_per_stream_eos(3);
++
++    fail_if(t.latched(3),
++            "stream 3 is still latched after its EOS was handled; a source "
++            "re-attached on that pad would be dropped forever");
++    t.destroy();
++}
++GST_END_TEST;
++
++// No counter is created for a stream without one; a drained one is removed.
++GST_START_TEST(per_stream_eos_leaves_no_counter_behind) {
++    auto t = InferUnderTest::make();
++
++    t.send_per_stream_eos(4);  // never had buffers
++    fail_if(t.has_pending_entry(4),
++            "handling EOS for a stream with no buffers created a counter");
++
++    {
++        std::lock_guard<std::mutex> lock(t.infer->_eos_ctx.eos_lock);
++        t.infer->_eos_ctx.stream_pending_buffers[5] = 0;  // drained
++    }
++    t.send_per_stream_eos(5);
++    fail_if(t.has_pending_entry(5),
++            "a drained stream's counter outlived the stream");
++    t.destroy();
++}
++GST_END_TEST;
++
++// An undrained counter stays: late completions still decrement it.
++GST_START_TEST(per_stream_eos_keeps_undrained_counter) {
++    auto t = InferUnderTest::make();
++    {
++        std::lock_guard<std::mutex> lock(t.infer->_eos_ctx.eos_lock);
++        t.infer->_eos_ctx.stream_pending_buffers[6] = 2;
++    }
++    fail_if(t.infer->_push_ctx.push_running,
++            "precondition: push thread not running, so the drain ends at once");
++
++    t.send_per_stream_eos(6);
++
++    fail_if(t.latched(6), "stream 6 is still latched");
++    fail_unless(t.has_pending_entry(6),
++                "an undrained counter was dropped; late completions would "
++                "recreate it below zero for the next source on this id");
++    t.destroy();
++}
++GST_END_TEST;
++
++// Other streams are untouched.
++GST_START_TEST(per_stream_eos_only_affects_its_stream) {
++    auto t = InferUnderTest::make();
++    {
++        std::lock_guard<std::mutex> lock(t.infer->_eos_ctx.eos_lock);
++        t.infer->_eos_ctx.stream_eos_arrived.insert(1);
++        t.infer->_eos_ctx.stream_pending_buffers[1] = 3;
++    }
++
++    t.send_per_stream_eos(2);
++
++    fail_unless(t.latched(1), "another stream's latch was released");
++    fail_unless(t.has_pending_entry(1), "another stream's counter was dropped");
++    t.destroy();
++}
++GST_END_TEST;
++
++static Suite *dxinfer_per_stream_eos_suite(void) {
++    Suite *s = suite_create("dxinfer_per_stream_eos");
++    TCase *tc = tcase_create("contract");
++    tcase_set_timeout(tc, 30.0);
++    suite_add_tcase(s, tc);
++    tcase_add_test(tc, per_stream_eos_releases_its_latch);
++    tcase_add_test(tc, per_stream_eos_leaves_no_counter_behind);
++    tcase_add_test(tc, per_stream_eos_keeps_undrained_counter);
++    tcase_add_test(tc, per_stream_eos_only_affects_its_stream);
++    return s;
++}
++
++GST_CHECK_MAIN(dxinfer_per_stream_eos);
+-- 
+2.43.0
+

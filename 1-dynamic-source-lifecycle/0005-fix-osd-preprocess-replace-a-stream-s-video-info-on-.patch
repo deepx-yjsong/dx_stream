@@ -1,0 +1,214 @@
+From 911efbeaf5901be49a3b93771ad71d086b78ae74 Mon Sep 17 00:00:00 2001
+From: deepx-yjsong <yjsong@deepx.ai>
+Date: Mon, 28 Sep 2026 17:56:58 +0900
+Subject: [PATCH 05/10] fix(osd,preprocess): replace a stream's video info on
+ every CAPS
+
+Both elements stored only the first CAPS per stream id and ignored later
+ones. A source reusing the stream id with another size kept the previous
+source's info: dxosd failed to map a smaller frame and returned
+GST_FLOW_ERROR, stopping the shared path; dxpreprocess fell back to a tight
+stride with a warning on every frame.
+
+Every CAPS now replaces the stream's info. The transform kernel pool is
+keyed by format and size, so a new size gets its own kernel.
+
+Tests: after a per-stream EOS and a new CAPS on the same id, dxosd draws a
+smaller frame (before: GST_FLOW_ERROR) and uses a larger one's size; the
+preprocess info follows the new CAPS.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ gst-dxstream-plugin/src/gst-dxosd.cpp         | 12 +--
+ gst-dxstream-plugin/src/gst-dxpreprocess.cpp  | 12 +--
+ .../test_dxpreprocess_caps_replace.cpp        | 50 +++++++++++++
+ .../transform/test_dxosd_caps_replace.cpp     | 74 +++++++++++++++++++
+ 4 files changed, 138 insertions(+), 10 deletions(-)
+ create mode 100644 test/base/element/inference/test_dxpreprocess_caps_replace.cpp
+ create mode 100644 test/base/element/transform/test_dxosd_caps_replace.cpp
+
+diff --git a/gst-dxstream-plugin/src/gst-dxosd.cpp b/gst-dxstream-plugin/src/gst-dxosd.cpp
+index aeefc3e..835556b 100644
+--- a/gst-dxstream-plugin/src/gst-dxosd.cpp
++++ b/gst-dxstream-plugin/src/gst-dxosd.cpp
+@@ -122,11 +122,13 @@ static GstCaps *gst_dxosd_transform_caps(GstBaseTransform *trans,
+ static void set_stream_info(GstDxOsd *self, GstEvent *event, int stream_id) {
+     GstCaps *incaps = nullptr;
+     gst_event_parse_caps(event, &incaps);
+-    // Only register on first caps event per stream_id.
+-    // Dynamic resolution change within a running stream is not supported.
+-    if (incaps && self->_stream_info.find(stream_id) == self->_stream_info.end()) {
+-        gst_video_info_init(&self->_stream_info[stream_id]);
+-        if (!gst_video_info_from_caps(&self->_stream_info[stream_id], incaps)) {
++    // Every CAPS replaces the stream's info: a source reusing the stream id
++    // (or a mid-stream change) may bring a different format or size.
++    if (incaps) {
++        GstVideoInfo info;
++        if (gst_video_info_from_caps(&info, incaps)) {
++            self->_stream_info[stream_id] = info;
++        } else {
+             GST_WARNING_OBJECT(self, "Failed to parse caps for stream %d", stream_id);
+             self->_stream_info.erase(stream_id);
+         }
+diff --git a/gst-dxstream-plugin/src/gst-dxpreprocess.cpp b/gst-dxstream-plugin/src/gst-dxpreprocess.cpp
+index d0052ac..2507812 100644
+--- a/gst-dxstream-plugin/src/gst-dxpreprocess.cpp
++++ b/gst-dxstream-plugin/src/gst-dxpreprocess.cpp
+@@ -467,11 +467,13 @@ static gboolean gst_dxpreprocess_set_caps(GstBaseTransform *trans,
+ void set_input_info(GstDxPreprocess *self, GstEvent *event, int stream_id) {
+     GstCaps *incaps = nullptr;
+     gst_event_parse_caps(event, &incaps);
+-    // Only register on first caps event per stream_id.
+-    // Dynamic resolution change within a running stream is not supported.
+-    if (incaps && self->_stream.info.find(stream_id) == self->_stream.info.end()) {
+-        gst_video_info_init(&self->_stream.info[stream_id]);
+-        if (!gst_video_info_from_caps(&self->_stream.info[stream_id], incaps)) {
++    // Every CAPS replaces the stream's info: a source reusing the stream id
++    // (or a mid-stream change) may bring a different format or size.
++    if (incaps) {
++        GstVideoInfo info;
++        if (gst_video_info_from_caps(&info, incaps)) {
++            self->_stream.info[stream_id] = info;
++        } else {
+             GST_WARNING_OBJECT(self, "Failed to parse caps for stream %d", stream_id);
+             self->_stream.info.erase(stream_id);
+         }
+diff --git a/test/base/element/inference/test_dxpreprocess_caps_replace.cpp b/test/base/element/inference/test_dxpreprocess_caps_replace.cpp
+new file mode 100644
+index 0000000..d42a06e
+--- /dev/null
++++ b/test/base/element/inference/test_dxpreprocess_caps_replace.cpp
+@@ -0,0 +1,50 @@
++// dxpreprocess — every CAPS replaces the stream's video info
++// A source reusing the stream id may have another size; the first CAPS must
++// not stick.
++
++#include <gst/check/gstcheck.h>
++#include <gst/check/gstharness.h>
++#include <gst/gst.h>
++#include "gst-dxpreprocess.hpp"
++#include "utils.hpp"
++
++static GstEvent *wcaps(int sid, int w, int h) {
++    gchar *str = g_strdup_printf(
++        "video/x-raw,format=RGB,width=%d,height=%d,framerate=30/1", w, h);
++    GstCaps *c = gst_caps_from_string(str);
++    g_free(str);
++    GstEvent *e = dx_event_wrap_downstream(sid, gst_event_new_caps(c));
++    gst_caps_unref(c);
++    return e;
++}
++
++GST_START_TEST(caps_replaces_stream_info) {
++    GstElement *e = gst_element_factory_make("dxpreprocess", nullptr);
++    g_object_set(e, "resize-width", 32, "resize-height", 32, nullptr);
++    GstHarness *h = gst_harness_new_with_element(e, "sink", "src");
++    gst_harness_set_src_caps_str(
++        h, "video/x-raw,format=RGB,width=1920,height=1080,framerate=30/1");
++    auto *pp = reinterpret_cast<GstDxPreprocess *>(e);
++
++    gst_harness_push_event(h, wcaps(1, 1920, 1080));
++    gst_harness_push_event(h, dx_event_wrap_downstream(1, gst_event_new_eos()));
++    gst_harness_push_event(h, wcaps(1, 640, 360));
++
++    fail_unless(pp->_stream.info.count(1) == 1);
++    fail_unless_equals_int(GST_VIDEO_INFO_WIDTH(&pp->_stream.info[1]), 640);
++    fail_unless_equals_int(GST_VIDEO_INFO_HEIGHT(&pp->_stream.info[1]), 360);
++
++    gst_harness_teardown(h);
++    gst_object_unref(e);
++}
++GST_END_TEST;
++
++static Suite *dxpreprocess_caps_replace_suite(void) {
++    Suite *s = suite_create("dxpreprocess_caps_replace");
++    TCase *tc = tcase_create("contract");
++    suite_add_tcase(s, tc);
++    tcase_add_test(tc, caps_replaces_stream_info);
++    return s;
++}
++
++GST_CHECK_MAIN(dxpreprocess_caps_replace);
+diff --git a/test/base/element/transform/test_dxosd_caps_replace.cpp b/test/base/element/transform/test_dxosd_caps_replace.cpp
+new file mode 100644
+index 0000000..f748ec3
+--- /dev/null
++++ b/test/base/element/transform/test_dxosd_caps_replace.cpp
+@@ -0,0 +1,74 @@
++// dxosd — every CAPS replaces the stream's video info
++// A source reusing the stream id may have another size.  With the first CAPS
++// kept, a smaller frame failed to map and the element returned an error.
++
++#include <gst/check/gstcheck.h>
++#include <gst/check/gstharness.h>
++#include <gst/gst.h>
++#include "gst-dxosd.hpp"
++#include "harness_helpers.hpp"
++#include "meta_helpers.hpp"
++#include "utils.hpp"
++
++using namespace dxtest;
++
++static GstEvent *wcaps(int sid, int w, int h) {
++    gchar *str = g_strdup_printf(
++        "video/x-raw,format=RGB,width=%d,height=%d,framerate=30/1", w, h);
++    GstCaps *c = gst_caps_from_string(str);
++    g_free(str);
++    GstEvent *e = dx_event_wrap_downstream(sid, gst_event_new_caps(c));
++    gst_caps_unref(c);
++    return e;
++}
++
++static GstBuffer *frame(GstHarness *h, int sid, int w, int hh) {
++    GstBuffer *b = gst_harness_create_buffer(h, (gsize)w * hh * 3);
++    gst_buffer_memset(b, 0, 0x10, (gsize)w * hh * 3);
++    GST_BUFFER_PTS(b) = 0;
++    GST_BUFFER_DURATION(b) = GST_SECOND / 30;
++    make_frame_meta(b, sid, w, hh);
++    return b;
++}
++
++static GstFlowReturn reuse(int w0, int h0, int w1, int h1, int *width_after) {
++    GstElement *e = gst_element_factory_make("dxosd", nullptr);
++    GstHarness *h = gst_harness_new_with_element(e, "sink", "src");
++    gst_harness_set_src_caps_str(
++        h, "video/x-raw,format=RGB,width=1920,height=1080,framerate=30/1");
++    gst_harness_push_event(h, wcaps(1, w0, h0));
++    fail_unless_equals_int(gst_harness_push(h, frame(h, 1, w0, h0)), GST_FLOW_OK);
++    gst_harness_push_event(h, dx_event_wrap_downstream(1, gst_event_new_eos()));
++    gst_harness_push_event(h, wcaps(1, w1, h1));
++    GstFlowReturn r = gst_harness_push(h, frame(h, 1, w1, h1));
++    *width_after = GST_VIDEO_INFO_WIDTH(
++        &reinterpret_cast<GstDxOsd *>(e)->_stream_info[1]);
++    gst_harness_teardown(h);
++    gst_object_unref(e);
++    return r;
++}
++
++GST_START_TEST(smaller_source_on_reused_id_is_drawn) {
++    int w = 0;
++    fail_unless_equals_int(reuse(1920, 1080, 640, 360, &w), GST_FLOW_OK);  // before: ERROR
++    fail_unless_equals_int(w, 640);
++}
++GST_END_TEST;
++
++GST_START_TEST(larger_source_on_reused_id_uses_its_size) {
++    int w = 0;
++    fail_unless_equals_int(reuse(640, 360, 1920, 1080, &w), GST_FLOW_OK);
++    fail_unless_equals_int(w, 1920);  // before: 640
++}
++GST_END_TEST;
++
++static Suite *dxosd_caps_replace_suite(void) {
++    Suite *s = suite_create("dxosd_caps_replace");
++    TCase *tc = tcase_create("contract");
++    suite_add_tcase(s, tc);
++    tcase_add_test(tc, smaller_source_on_reused_id_is_drawn);
++    tcase_add_test(tc, larger_source_on_reused_id_uses_its_size);
++    return s;
++}
++
++GST_CHECK_MAIN(dxosd_caps_replace);
+-- 
+2.43.0
+

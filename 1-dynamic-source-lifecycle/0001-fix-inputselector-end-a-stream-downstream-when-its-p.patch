@@ -1,0 +1,220 @@
+From 3769e88d4ca3641b29196f6ba1512eaf21f3d8b1 Mon Sep 17 00:00:00 2001
+From: deepx-yjsong <yjsong@deepx.ai>
+Date: Mon, 28 Sep 2026 17:53:22 +0900
+Subject: [PATCH 01/10] fix(inputselector): end a stream downstream when its
+ pad is released
+
+A per-stream EOS was sent only from aggregate(), once it saw the pad's EOS.
+Releasing a pad flushes its queue, including an EOS aggregate() had not
+reached yet, and a source removed without EOS never sends one. Either way
+downstream per-stream state was never told the stream ended.
+
+release_pad now sends the wrapped per-stream EOS itself unless aggregate()
+already did, and only while the element is running. Same role as the
+PAD_DELETED/STREAM_EOS events other muxers send on pad removal.
+
+Test: releasing without EOS, or right after sending EOS, gives exactly one
+wrapped EOS (before: none in both cases); no repeat after a forwarded EOS;
+none while stopped.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ .../src/gst-dxinputselector.cpp               |  16 +-
+ .../test_dxinputselector_release_eos.cpp      | 155 ++++++++++++++++++
+ 2 files changed, 169 insertions(+), 2 deletions(-)
+ create mode 100644 test/base/element/multistream/test_dxinputselector_release_eos.cpp
+
+diff --git a/gst-dxstream-plugin/src/gst-dxinputselector.cpp b/gst-dxstream-plugin/src/gst-dxinputselector.cpp
+index 7a2f3af..4ad7a32 100644
+--- a/gst-dxstream-plugin/src/gst-dxinputselector.cpp
++++ b/gst-dxstream-plugin/src/gst-dxinputselector.cpp
+@@ -222,11 +222,23 @@ static gboolean gst_dxinputselector_stop(GstAggregator *agg) {
+ 
+ static void gst_dxinputselector_release_pad(GstElement *element, GstPad *pad) {
+     GstDxInputSelector *self = GST_DXINPUTSELECTOR(element);
++    GstAggregator *agg = GST_AGGREGATOR(element);
+     gint stream_id = get_sink_pad_index(pad);
++    const gboolean running = gst_pad_is_active(GST_AGGREGATOR_SRC_PAD(agg));
++
++    /* Release first: once the pad is gone aggregate() can no longer mark its
++     * EOS as sent, so the check below cannot race with it. */
++    GST_ELEMENT_CLASS(parent_class)->release_pad(element, pad);
++
+     GST_OBJECT_LOCK(self);
+-    self->_stream_eos_sent.erase(stream_id);
++    const gboolean eos_sent = self->_stream_eos_sent.erase(stream_id) > 0;
+     GST_OBJECT_UNLOCK(self);
+-    GST_ELEMENT_CLASS(parent_class)->release_pad(element, pad);
++
++    /* Releasing drops whatever the pad still queued, including an EOS that
++     * aggregate() had not seen.  Signal the end of the stream here so
++     * downstream per-stream state always ends with the pad. */
++    if (!eos_sent && running)
++        send_wrapped_eos(agg, stream_id);
+ }
+ 
+ static void gst_dxinputselector_class_init(GstDxInputSelectorClass *klass) {
+diff --git a/test/base/element/multistream/test_dxinputselector_release_eos.cpp b/test/base/element/multistream/test_dxinputselector_release_eos.cpp
+new file mode 100644
+index 0000000..3368205
+--- /dev/null
++++ b/test/base/element/multistream/test_dxinputselector_release_eos.cpp
+@@ -0,0 +1,155 @@
++// dxinputselector — releasing a pad ends its stream downstream
++// Exactly one wrapped per-stream EOS per released pad, whether or not the
++// source sent EOS first, and none while the element is not running.
++
++#include <gst/check/gstcheck.h>
++#include <gst/gst.h>
++#include "utils.hpp"
++#include <cstring>
++
++static gint g_eos0 = 0;
++
++static GstPadProbeReturn count_eos0(GstPad *, GstPadProbeInfo *info, gpointer) {
++    GstEvent *e = GST_PAD_PROBE_INFO_EVENT(info);
++    if (e && dx_event_is_wrapped_downstream(e)) {
++        gint sid = -1;
++        GstEvent *inner = dx_event_peek_inner(e, &sid);
++        if (inner && GST_EVENT_TYPE(inner) == GST_EVENT_EOS && sid == 0)
++            g_atomic_int_inc(&g_eos0);
++    }
++    return GST_PAD_PROBE_OK;
++}
++
++static void preamble(GstPad *pad, const gchar *label) {
++    fail_unless(gst_pad_send_event(pad, gst_event_new_stream_start(label)));
++    GstCaps *caps = gst_caps_from_string(
++        "video/x-raw,format=RGB,width=4,height=4,framerate=30/1");
++    fail_unless(gst_pad_send_event(pad, gst_event_new_caps(caps)));
++    gst_caps_unref(caps);
++    GstSegment seg;
++    gst_segment_init(&seg, GST_FORMAT_TIME);
++    fail_unless(gst_pad_send_event(pad, gst_event_new_segment(&seg)));
++}
++
++static void push(GstPad *pad, GstClockTime pts) {
++    GstBuffer *b = gst_buffer_new_allocate(nullptr, 4 * 4 * 3, nullptr);
++    gst_buffer_memset(b, 0, 0x80, 4 * 4 * 3);
++    GST_BUFFER_PTS(b) = pts;
++    GST_BUFFER_DURATION(b) = GST_SECOND / 30;
++    fail_unless_equals_int(gst_pad_chain(pad, b), GST_FLOW_OK);
++}
++
++static void wait_for(gint want, gulong max_ms) {
++    for (gulong t = 0; t < max_ms && g_atomic_int_get(&g_eos0) < want; t += 10)
++        g_usleep(10 * 1000);
++}
++
++struct Sel {
++    GstElement *pipe, *agg;
++    GstPad *s0, *s1;
++
++    static Sel make() {
++        Sel t;
++        g_atomic_int_set(&g_eos0, 0);
++        t.pipe = gst_pipeline_new(nullptr);
++        t.agg = gst_element_factory_make("dxinputselector", nullptr);
++        GstElement *sink = gst_element_factory_make("fakesink", nullptr);
++        g_object_set(sink, "async", FALSE, "sync", FALSE, nullptr);
++        gst_bin_add_many(GST_BIN(t.pipe), t.agg, sink, nullptr);
++        fail_unless(gst_element_link(t.agg, sink));
++        t.s1 = gst_element_request_pad_simple(t.agg, "sink_1");
++        t.s0 = gst_element_request_pad_simple(t.agg, "sink_0");
++        GstPad *src = gst_element_get_static_pad(t.agg, "src");
++        gst_pad_add_probe(src, GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM, count_eos0,
++                          nullptr, nullptr);
++        gst_object_unref(src);
++        return t;
++    }
++
++    void play() {
++        fail_unless(gst_element_set_state(pipe, GST_STATE_PLAYING) !=
++                    GST_STATE_CHANGE_FAILURE);
++        preamble(s1, "s1");
++        preamble(s0, "s0");
++        push(s1, 0);
++        push(s0, 0);
++    }
++
++    void release0() {
++        gst_element_release_request_pad(agg, s0);
++        gst_object_unref(s0);
++        s0 = nullptr;
++    }
++
++    void destroy() {
++        gst_element_set_state(pipe, GST_STATE_NULL);
++        if (s0) gst_object_unref(s0);
++        gst_object_unref(s1);
++        gst_object_unref(pipe);
++    }
++};
++
++// The source never sent EOS (e.g. it was set to NULL and removed).
++GST_START_TEST(release_without_eos_ends_the_stream) {
++    auto t = Sel::make();
++    t.play();
++    t.release0();
++    wait_for(1, 1000);
++    g_usleep(100 * 1000);
++    fail_unless_equals_int(g_atomic_int_get(&g_eos0), 1);
++    t.destroy();
++}
++GST_END_TEST;
++
++// EOS sent and the pad released right away: the queued EOS may be dropped by
++// the release, the stream must still end exactly once.
++GST_START_TEST(eos_then_immediate_release_ends_once) {
++    auto t = Sel::make();
++    t.play();
++    fail_unless(gst_pad_send_event(t.s0, gst_event_new_eos()));
++    t.release0();
++    push(t.s1, GST_SECOND / 30);  // let aggregate() run
++    wait_for(1, 1000);
++    g_usleep(200 * 1000);
++    fail_unless_equals_int(g_atomic_int_get(&g_eos0), 1);
++    t.destroy();
++}
++GST_END_TEST;
++
++// EOS already forwarded by aggregate(): releasing must not repeat it.
++GST_START_TEST(release_after_forwarded_eos_does_not_repeat) {
++    auto t = Sel::make();
++    t.play();
++    fail_unless(gst_pad_send_event(t.s0, gst_event_new_eos()));
++    push(t.s1, GST_SECOND / 30);
++    wait_for(1, 1000);
++    fail_unless_equals_int(g_atomic_int_get(&g_eos0), 1);
++    t.release0();
++    g_usleep(200 * 1000);
++    fail_unless_equals_int(g_atomic_int_get(&g_eos0), 1);
++    t.destroy();
++}
++GST_END_TEST;
++
++// Not running (pipeline torn down): nothing to signal.
++GST_START_TEST(release_while_stopped_sends_nothing) {
++    auto t = Sel::make();
++    t.release0();
++    fail_unless_equals_int(g_atomic_int_get(&g_eos0), 0);
++    t.destroy();
++}
++GST_END_TEST;
++
++static Suite *dxinputselector_release_eos_suite(void) {
++    Suite *s = suite_create("dxinputselector_release_eos");
++    TCase *tc = tcase_create("contract");
++    tcase_set_timeout(tc, 30.0);
++    suite_add_tcase(s, tc);
++    tcase_add_test(tc, release_without_eos_ends_the_stream);
++    tcase_add_test(tc, eos_then_immediate_release_ends_once);
++    tcase_add_test(tc, release_after_forwarded_eos_does_not_repeat);
++    tcase_add_test(tc, release_while_stopped_sends_nothing);
++    return s;
++}
++
++GST_CHECK_MAIN(dxinputselector_release_eos);
+-- 
+2.43.0
+
